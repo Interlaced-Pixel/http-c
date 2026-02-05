@@ -13,20 +13,27 @@ Build a memory-efficient HTTP server using event-driven architecture, streaming 
 4. ✅ Add platform socket abstractions (POSIX/Windows support)
 5. ✅ Implement memory management (static pools)
 6. ✅ Create demo application (simple_server with GET /hello support)
+7. ✅ Full header parsing added (Content-Length, Connection)
+8. ✅ POST/PUT upload streaming (in-memory buffer with spill-to-disk temp files)
+9. ✅ Keep-Alive / persistent connections implemented and hardened (send-all, pipelining protection, SIGPIPE handling)
+10. ✅ Security hardening: path normalization and traversal protection implemented
+11. ✅ Reverted logging level to LOG_INFO for production stability
+12. ✅ Chunked Transfer Encoding implemented and verified
 
 ## Remaining Steps
-7. Add robustness features (timeouts, error handling, logging)
-8. Write unit tests (parser and server tests)
-9. Optimize for production (chunked encoding, buffer pooling)
-10. Add TLS support (mbedTLS integration)
-11. Documentation and build (README, CMake, LICENSE)
+13. Implement Range requests
+14. Security hardening: rate limiting and additional header validation
+15. Performance tuning: buffer pooling and memory tuning
+16. TLS support (mbedTLS integration)
+17. Further testing: add automated tests for uploads and file serving flows
+18. Docs, examples, and release packaging
 
 ## Verification
-- Unit tests: `make test` passes all tests
-- Integration: `curl http://localhost:8080/hello` returns "Hello HTTP!"
-- Stress: `ab -n 1000 -c 8` handles load without memory leaks
-- Cross-platform: Builds on Linux/macOS/Windows
-- Memory: <600KB RAM for 8 connections
+- Unit tests: `./tests/keepalive_test.sh` verifies keep-alive; `./tests/security_test.sh` verifies traversal protection.
+- Integration: `curl http://localhost:8080/` serves `index.html` and file listing.
+- Uploads: large POSTs stream to temp file under `SERVE_PATH`.
+- Cross-platform: Builds on macOS and Linux (POSIX).
+- Memory: target remains <600KB RAM for 8 connections.
 
 ## Decisions
 - Event-driven single-threaded: 10-100x RAM savings vs threads
@@ -34,3 +41,10 @@ Build a memory-efficient HTTP server using event-driven architecture, streaming 
 - Static pools: Eliminates fragmentation, compile-time config
 - Callback parser: Streaming design keeps memory constant
 - Makefile primary: Dependency-free for embedded
+
+## Notes & Next Actions
+- Chunked Transfer: Implemented new API and verified with tests.
+- Security: Path normalization implemented in `http.h` and used in `example.c`.
+- Recommended next immediate tasks:
+	- Implement Range requests for large file streaming/resume support.
+	- Add more unit tests for parser edge cases (header overflow, malformed request lines).

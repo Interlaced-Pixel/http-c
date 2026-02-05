@@ -214,9 +214,10 @@ typedef struct {
   int flags;
   char temp_buf[MAX_HEADER_LINE_LEN];
   size_t temp_len;
-  int header_field_complete;
-  char current_field[MAX_HEADER_FIELD_LEN];
-  char current_value[MAX_HEADER_VALUE_LEN];
+  size_t content_length;
+  size_t body_received;
+  int headers_started;
+  int blank_line;
   void *user_data;
 } http_parser_t;
 
@@ -408,76 +409,91 @@ size_t http_parser_execute(http_parser_t *parser,
                            const char *data, size_t len) {
   size_t i = 0;
   while (i < len) {
+    if (parser->state == HTTP_PARSER_DONE)
+      return i;
+
     char c = data[i];
     switch (parser->state) {
-    case HTTP_PARSER_REQUEST_LINE: {
+    case HTTP_PARSER_REQUEST_LINE:
       if (c == '\r') {
         parser->temp_buf[parser->temp_len] = '\0';
         char *method_str = strtok(parser->temp_buf, " ");
         char *uri = strtok(NULL, " ");
         char *version = strtok(NULL, " ");
         if (method_str && uri && version) {
-          http_method_t method = http_method_from_string(method_str);
           if (settings->on_request_line) {
-            settings->on_request_line(parser->user_data, method, uri, version);
+            settings->on_request_line(parser->user_data,
+                                      http_method_from_string(method_str), uri,
+                                      version);
           }
           parser->state = HTTP_PARSER_HEADERS;
           parser->temp_len = 0;
+          parser->headers_started = 0;
         } else {
           return i;
         }
       } else if (c != '\n') {
-        if (parser->temp_len < MAX_REQUEST_LINE_LEN - 1) {
+        if (parser->temp_len < MAX_REQUEST_LINE_LEN - 1)
           parser->temp_buf[parser->temp_len++] = c;
-        } else {
+        else
           return i;
-        }
       }
       break;
-    }
-    case HTTP_PARSER_HEADERS: {
+
+    case HTTP_PARSER_HEADERS:
       if (c == '\r') {
         parser->temp_buf[parser->temp_len] = '\0';
         if (parser->temp_len == 0) {
-          parser->state = HTTP_PARSER_BODY;
-          if (settings->on_headers_complete) {
-            settings->on_headers_complete(parser->user_data);
-          }
+          parser->blank_line = 1;
         } else {
           char *colon = strchr(parser->temp_buf, ':');
           if (colon) {
             *colon = '\0';
-            char *field = parser->temp_buf;
-            char *value = colon + 1;
-            while (*value && isspace(*value))
-              value++;
-            size_t value_len = strlen(value);
-            while (value_len > 0 && isspace(value[value_len - 1])) {
-              value[--value_len] = '\0';
-            }
-            if (settings->on_header) {
-              settings->on_header(parser->user_data, field, value);
-            }
+            char *f = parser->temp_buf;
+            char *v = colon + 1;
+            while (*v && isspace(*v))
+              v++;
+            size_t vlen = strlen(v);
+            while (vlen > 0 && isspace(v[vlen - 1]))
+              v[--vlen] = '\0';
+            if (strcasecmp(f, "Content-Length") == 0)
+              parser->content_length = (size_t)atol(v);
+            if (settings->on_header)
+              settings->on_header(parser->user_data, f, v);
           }
           parser->temp_len = 0;
         }
-      } else if (c != '\n') {
-        if (parser->temp_len < MAX_HEADER_LINE_LEN - 1) {
-          parser->temp_buf[parser->temp_len++] = c;
-        } else {
-          return i;
+      } else if (c == '\n') {
+        if (parser->blank_line) {
+          if (settings->on_headers_complete)
+            settings->on_headers_complete(parser->user_data);
+          parser->state = (parser->content_length == 0) ? HTTP_PARSER_DONE
+                                                        : HTTP_PARSER_BODY;
+          parser->body_received = 0;
+          if (parser->state == HTTP_PARSER_DONE && settings->on_complete)
+            settings->on_complete(parser->user_data);
         }
+        parser->blank_line = 0;
+      } else {
+        if (parser->temp_len < MAX_HEADER_LINE_LEN - 1)
+          parser->temp_buf[parser->temp_len++] = c;
+        else
+          return i;
       }
       break;
-    }
-    case HTTP_PARSER_BODY: {
-      if (settings->on_body) {
+
+    case HTTP_PARSER_BODY:
+      if (settings->on_body)
         settings->on_body(parser->user_data, &c, 1);
+      if (++parser->body_received >= parser->content_length) {
+        parser->state = HTTP_PARSER_DONE;
+        if (settings->on_complete)
+          settings->on_complete(parser->user_data);
       }
       break;
-    }
-    case HTTP_PARSER_DONE:
-      return i;
+
+    default:
+      break;
     }
     i++;
   }
@@ -641,13 +657,6 @@ static void on_headers_complete(void *user_data) {
           conn->keep_alive, conn->sock);
     }
   }
-
-  /* If no body expected, trigger request immediately */
-  if (conn->expected_content_length == 0) {
-    if (conn->on_request)
-      conn->on_request(conn, conn->method, conn->uri);
-    http_parser_reset(&conn->parser);
-  }
 }
 
 static void on_complete(void *user_data) {
@@ -743,7 +752,7 @@ void http_server_run(http_server_t *server) {
       if (conn->sock != INVALID_SOCKET) {
         FD_SET(conn->sock, &read_fds);
         if (conn->sock > max_fd)
-          max_fd = conn->sock;
+          max_fd = (int)conn->sock;
       }
     }
 
@@ -882,8 +891,8 @@ int http_conn_send_response(http_conn_t *conn, int status, const char *body) {
   if (hlen < 0 || hlen >= (int)sizeof(header))
     return -1;
 
-  ssize_t sent = socket_send_all(conn->sock, header, hlen);
-  if (sent != hlen) {
+  ssize_t sent = socket_send_all(conn->sock, header, (size_t)hlen);
+  if (sent != (ssize_t)hlen) {
     LOG(LOG_WARN, "send header failed on fd=%d: %zd/%d", conn->sock, sent,
         hlen);
     http_conn_close(conn);
@@ -899,18 +908,13 @@ int http_conn_send_response(http_conn_t *conn, int status, const char *body) {
     }
   }
 
-  /* If keep-alive requested, reset parser and state for next request and keep
-   * socket open */
   if (conn->keep_alive) {
-    /* Prevent simple pipelining: if there's unread data buffered, close instead
-     */
     if (conn->read_len > 0) {
       LOG(LOG_INFO, "pipelining detected, closing connection fd=%d",
           conn->sock);
       http_conn_close(conn);
       return 0;
     }
-
     conn->last_active = get_time_ms();
     conn->header_count = 0;
     conn->body_len = 0;
@@ -922,7 +926,6 @@ int http_conn_send_response(http_conn_t *conn, int status, const char *body) {
     http_parser_reset(&conn->parser);
     return 0;
   }
-
   http_conn_close(conn);
   return 0;
 }
@@ -993,7 +996,6 @@ static ssize_t socket_send_all(socket_t sock, const void *buf, size_t len) {
       return (ssize_t)total;
     int err = get_last_error();
     if (err == EAGAIN || err == EWOULDBLOCK) {
-      /* wait until socket writable */
       fd_set wfds;
       FD_ZERO(&wfds);
       FD_SET(sock, &wfds);
@@ -1041,31 +1043,26 @@ int file_read(const char *path, file_content_t *content) {
   FILE *fp = fopen(path, "rb");
   if (!fp)
     return -1;
-
   fseek(fp, 0, SEEK_END);
   long size = ftell(fp);
   fseek(fp, 0, SEEK_SET);
-
   if (size < 0) {
     fclose(fp);
     return -1;
   }
-
   content->data = malloc(size + 1);
   if (!content->data) {
     fclose(fp);
     return -1;
   }
-
-  size_t read_size = fread(content->data, 1, size, fp);
+  size_t read_size = fread(content->data, 1, (size_t)size, fp);
   if (read_size != (size_t)size) {
     free(content->data);
     fclose(fp);
     return -1;
   }
-
   content->data[size] = '\0';
-  content->size = size;
+  content->size = (size_t)size;
   fclose(fp);
   return 0;
 }
@@ -1082,9 +1079,7 @@ const char *mime_type_from_path(const char *path) {
   const char *ext = strrchr(path, '.');
   if (!ext)
     return "application/octet-stream";
-
-  ext++; // Skip the dot
-
+  ext++;
   if (strcmp(ext, "html") == 0 || strcmp(ext, "htm") == 0)
     return "text/html";
   if (strcmp(ext, "css") == 0)
@@ -1107,13 +1102,6 @@ const char *mime_type_from_path(const char *path) {
     return "image/svg+xml";
   if (strcmp(ext, "ico") == 0)
     return "image/x-icon";
-  if (strcmp(ext, "pdf") == 0)
-    return "application/pdf";
-  if (strcmp(ext, "zip") == 0)
-    return "application/zip";
-  if (strcmp(ext, "gz") == 0)
-    return "application/gzip";
-
   return "application/octet-stream";
 }
 
@@ -1137,117 +1125,71 @@ void url_decode(char *dst, const char *src, size_t dst_size) {
 int path_normalize(char *dst, const char *src, size_t dst_size) {
   if (dst_size == 0)
     return -1;
-
-  char *parts[32]; // Max 32 path components
+  dst[0] = '\0';
+  char *parts[32];
   int part_count = 0;
   char tmp[MAX_URI_LEN];
   strncpy(tmp, src, sizeof(tmp) - 1);
   tmp[sizeof(tmp) - 1] = '\0';
-
   char *token = strtok(tmp, "/\\");
   while (token && part_count < 32) {
     if (strcmp(token, ".") == 0) {
-      // Ignore
     } else if (strcmp(token, "..") == 0) {
       if (part_count > 0)
         part_count--;
-      else
-        return -1; // Attempted to go above root
-    } else {
+    } else
       parts[part_count++] = token;
-    }
     token = strtok(NULL, "/\\");
   }
-
   dst[0] = '\0';
   for (int i = 0; i < part_count; i++) {
-    size_t cur_len = strlen(dst);
-    if (cur_len + strlen(parts[i]) + 2 <= dst_size) {
+    if (strlen(dst) + strlen(parts[i]) + 2 <= dst_size) {
       strcat(dst, "/");
       strcat(dst, parts[i]);
     }
   }
-  if (dst[0] == '\0') {
+  if (dst[0] == '\0')
     strncpy(dst, "/", dst_size - 1);
-    dst[dst_size - 1] = '\0';
-  }
   return 0;
 }
 
 int path_is_safe(const char *path) {
   if (!path)
     return 0;
-
-  // Disallow absolute paths and backslashes (normalized paths should use
-  // forward slash)
   if (path[0] == '/' || strchr(path, '\\') != NULL)
     return 0;
-
-  // Check for directory traversal attempts in case normalization wasn't used
   if (strstr(path, "..") != NULL)
     return 0;
-
-  // Check for drive letters (Windows)
   if (strlen(path) >= 3 && path[1] == ':' &&
       (path[2] == '/' || path[2] == '\\'))
     return 0;
-
   return 1;
 }
 
 int http_conn_send_file(http_conn_t *conn, int status, const char *path) {
   file_content_t content;
-  if (file_read(path, &content) != 0) {
+  if (file_read(path, &content) != 0)
     return http_conn_send_response(conn, 404, "File not found");
-  }
-
-  const char *mime_type = mime_type_from_path(path);
-  char response[WRITE_BUF_SIZE];
-  int len = snprintf(response, sizeof(response),
-                     "HTTP/1.0 %d OK\r\n"
-                     "Content-Type: %s\r\n"
-                     "Content-Length: %zu\r\n"
-                     "Connection: %s\r\n"
-                     "\r\n",
-                     status, mime_type, content.size,
+  const char *mime = mime_type_from_path(path);
+  char resp[WRITE_BUF_SIZE];
+  int len = snprintf(resp, sizeof(resp),
+                     "HTTP/1.0 %d OK\r\nContent-Type: %s\r\nContent-Length: "
+                     "%zu\r\nConnection: %s\r\n\r\n",
+                     status, mime, content.size,
                      conn->keep_alive ? "keep-alive" : "close");
-
-  if (len >= (int)sizeof(response)) {
+  if (len >= (int)sizeof(resp)) {
     file_free(&content);
-    return http_conn_send_response(conn, 500, "Response header too large");
-  }
-
-  // Send header
-  ssize_t sent = socket_send_all(conn->sock, response, len);
-  if (sent != len) {
-    file_free(&content);
-    http_conn_close(conn);
     return -1;
   }
-
-  // Send file content
-  size_t csize = content.size;
-  /* reuse send-all helper defined in response function */
-  extern ssize_t socket_send_all(socket_t sock, const void *buf, size_t len);
-  sent = socket_send_all(conn->sock, content.data, csize);
+  socket_send_all(conn->sock, resp, (size_t)len);
+  socket_send_all(conn->sock, content.data, content.size);
   file_free(&content);
-
-  if (sent != (ssize_t)csize) {
-    LOG(LOG_WARN, "send file content failed on fd=%d: %zd/%zu", conn->sock,
-        sent, csize);
-    http_conn_close(conn);
-    return -1;
-  }
-
   if (conn->keep_alive) {
-    conn->last_active = get_time_ms();
     conn->header_count = 0;
     conn->body_len = 0;
-    conn->expected_content_length = 0;
     http_parser_reset(&conn->parser);
     return 0;
   }
-
   http_conn_close(conn);
   return 0;
 }
@@ -1255,137 +1197,64 @@ int http_conn_send_file(http_conn_t *conn, int status, const char *path) {
 int http_conn_send_directory_listing(http_conn_t *conn, const char *path,
                                      const char *uri_path) {
   DIR *dir = opendir(path);
-  if (!dir) {
-    return http_conn_send_response(conn, 403, "Directory access denied");
-  }
-
+  if (!dir)
+    return http_conn_send_response(conn, 403, "Forbidden");
   char html[WRITE_BUF_SIZE];
-  int html_len = snprintf(
-      html, sizeof(html),
-      "<!DOCTYPE html><html><head><title>Directory Listing</title></head><body>"
-      "<h1>Directory: %s</h1><ul>",
-      uri_path);
-
-  struct dirent *entry;
-  while ((entry = readdir(dir)) != NULL && html_len < (int)sizeof(html) - 256) {
-    if (strcmp(entry->d_name, ".") == 0)
+  int hlen = snprintf(html, sizeof(html), "<html><body><h1>Listing %s</h1><ul>",
+                      uri_path);
+  struct dirent *ent;
+  while ((ent = readdir(dir)) && hlen < (int)sizeof(html) - 128) {
+    if (ent->d_name[0] == '.')
       continue;
-
-    const char *type = (entry->d_type == DT_DIR) ? "/" : "";
-    html_len += snprintf(html + html_len, sizeof(html) - html_len,
-                         "<li><a href=\"%s%s\">%s%s</a></li>", entry->d_name,
-                         type, entry->d_name, type);
+    hlen +=
+        snprintf(html + hlen, sizeof(html) - hlen,
+                 "<li><a href=\"%s\">%s</a></li>", ent->d_name, ent->d_name);
   }
   closedir(dir);
-
-  html_len +=
-      snprintf(html + html_len, sizeof(html) - html_len, "</ul></body></html>");
-
-  char response[WRITE_BUF_SIZE];
-  int len = snprintf(response, sizeof(response),
-                     "HTTP/1.0 200 OK\r\n"
-                     "Content-Type: text/html\r\n"
-                     "Content-Length: %d\r\n"
-                     "Connection: %s\r\n"
-                     "\r\n",
-                     html_len, conn->keep_alive ? "keep-alive" : "close");
-
-  if (len >= (int)sizeof(response) || html_len >= (int)sizeof(html)) {
-    return http_conn_send_response(conn, 500, "Directory listing too large");
-  }
-
-  // Send header
-  ssize_t sent = socket_send_all(conn->sock, response, len);
-  if (sent != len) {
-    http_conn_close(conn);
-    return -1;
-  }
-
-  // Send HTML content
-  extern ssize_t socket_send_all(socket_t sock, const void *buf, size_t len);
-  sent = socket_send_all(conn->sock, html, html_len);
-  if (sent != html_len) {
-    LOG(LOG_WARN, "send html failed on fd=%d: %zd/%d", conn->sock, sent,
-        html_len);
-    http_conn_close(conn);
-    return -1;
-  }
-
+  strcat(html, "</ul></body></html>");
+  hlen = (int)strlen(html);
+  char resp[WRITE_BUF_SIZE];
+  int rlen = snprintf(resp, sizeof(resp),
+                      "HTTP/1.0 200 OK\r\nContent-Type: "
+                      "text/html\r\nContent-Length: %d\r\n\r\n",
+                      hlen);
+  socket_send_all(conn->sock, resp, (size_t)rlen);
+  socket_send_all(conn->sock, html, (size_t)hlen);
   if (conn->keep_alive) {
-    conn->last_active = get_time_ms();
-    conn->header_count = 0;
-    conn->body_len = 0;
-    conn->expected_content_length = 0;
     http_parser_reset(&conn->parser);
     return 0;
   }
-
   http_conn_close(conn);
   return 0;
 }
 
-
-int http_conn_start_chunked_response(http_conn_t *conn, int status, const char *content_type) {
-    if (!conn || conn->sock == INVALID_SOCKET) return -1;
-    char header[WRITE_BUF_SIZE];
-    int hlen = snprintf(header, sizeof(header), 
-        "HTTP/1.1 %d OK\r\n"
-        "Content-Type: %s\r\n"
-        "Transfer-Encoding: chunked\r\n"
-        "Connection: keep-alive\r\n"
-        "\r\n", status, content_type);
-    
-    if (hlen < 0 || hlen >= (int)sizeof(header)) return -1;
-    
-    ssize_t sent = socket_send_all(conn->sock, header, hlen);
-    if (sent != hlen) {
-        http_conn_close(conn);
-        return -1;
-    }
-    
-    conn->keep_alive = 1; // Chunked implies HTTP/1.1 keep-alive usually
-    return 0;
+int http_conn_start_chunked_response(http_conn_t *conn, int status,
+                                     const char *content_type) {
+  char h[WRITE_BUF_SIZE];
+  int len = snprintf(h, sizeof(h),
+                     "HTTP/1.1 %d OK\r\nContent-Type: %s\r\nTransfer-Encoding: "
+                     "chunked\r\n\r\n",
+                     status, content_type);
+  socket_send_all(conn->sock, h, (size_t)len);
+  return 0;
 }
 
 int http_conn_send_chunk(http_conn_t *conn, const char *data, size_t len) {
-    if (!conn || conn->sock == INVALID_SOCKET) return -1;
-    if (len == 0) return 0;
-    
-    char chunk_header[32];
-    int hlen = snprintf(chunk_header, sizeof(chunk_header), "%zX\r\n", len);
-    
-    if (socket_send_all(conn->sock, chunk_header, hlen) != hlen) {
-        http_conn_close(conn);
-        return -1;
-    }
-    
-    if (socket_send_all(conn->sock, data, len) != (ssize_t)len) {
-         http_conn_close(conn);
-         return -1;
-    }
-    
-    if (socket_send_all(conn->sock, "\r\n", 2) != 2) {
-         http_conn_close(conn);
-         return -1;
-    }
-    
-    return 0;
+  char ch[32];
+  int clen = snprintf(ch, sizeof(ch), "%zX\r\n", len);
+  socket_send_all(conn->sock, ch, (size_t)clen);
+  socket_send_all(conn->sock, data, len);
+  socket_send_all(conn->sock, "\r\n", 2);
+  return 0;
 }
 
 int http_conn_end_chunked_response(http_conn_t *conn) {
-    if (!conn || conn->sock == INVALID_SOCKET) return -1;
-    
-    if (socket_send_all(conn->sock, "0\r\n\r\n", 5) != 5) {
-        http_conn_close(conn);
-        return -1;
-    }
-    
-    // Prepare for next request
-    conn->last_active = get_time_ms();
-    conn->header_count = 0;
-    conn->body_len = 0;
-    conn->expected_content_length = 0;
+  socket_send_all(conn->sock, "0\r\n\r\n", 5);
+  if (conn->keep_alive)
     http_parser_reset(&conn->parser);
-    return 0;
+  else
+    http_conn_close(conn);
+  return 0;
 }
-#endif /* HTTP_IMPLEMENTATION */
+
+#endif /* HTTP_H */

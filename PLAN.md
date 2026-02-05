@@ -25,7 +25,7 @@ Build a memory-efficient HTTP server using event-driven architecture, streaming 
 14. Security hardening: rate limiting and additional header validation
 15. Performance tuning: buffer pooling and memory tuning
 16. TLS support (mbedTLS integration)
-17. Further testing: add automated tests for uploads and file serving flows
+17. Comprehensive unit testing
 18. Docs, examples, and release packaging
 
 ## Verification

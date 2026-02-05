@@ -3,5 +3,13 @@ example.pid
 example.log
 example
 .vscode/
-tests/
 dbg.pid
+unit_tests.dSYM/
+unit_tests*
+test.tmp
+*.gcov
+*.gcda
+*.info
+*.dSYM
+*.gcno
+*.out

@@ -4,3 +4,4 @@ example.log
 example
 .vscode/
 tests/
+dbg.pid

@@ -3,3 +3,4 @@ example.pid
 example.log
 example
 .vscode/
+tests/

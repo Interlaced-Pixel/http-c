@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <time.h>
+#include <signal.h>
 
 /* Configuration */
 #ifndef BIND_PORT
@@ -87,7 +88,7 @@
 /* Logging */
 typedef enum { LOG_ERROR = 0, LOG_WARN = 1, LOG_INFO = 2, LOG_DEBUG = 3 } log_level_t;
 #ifndef LOG_LEVEL
-#define LOG_LEVEL LOG_INFO
+#define LOG_LEVEL LOG_DEBUG
 #endif
 #define LOG(level, fmt, ...) do { if (level <= LOG_LEVEL) fprintf(stderr, "%s: " fmt "\n", (level==LOG_ERROR?"ERR":(level==LOG_WARN?"WRN":(level==LOG_INFO?"INF":"DBG"))), ##__VA_ARGS__); } while(0)
 
@@ -278,6 +279,7 @@ int socket_connect(socket_t sock, const struct sockaddr *addr, socklen_t addrlen
 int socket_nonblocking(socket_t sock);
 ssize_t socket_recv(socket_t sock, void *buf, size_t len, int flags);
 ssize_t socket_send(socket_t sock, const void *buf, size_t len, int flags);
+static ssize_t socket_send_all(socket_t sock, const void *buf, size_t len);
 int socket_close(socket_t sock);
 unsigned long get_time_ms(void);
 int get_last_error(void);
@@ -445,7 +447,10 @@ int http_parser_is_done(const http_parser_t *parser) {
 }
 
 void http_parser_reset(http_parser_t *parser) {
+    void *ud = NULL;
+    if (parser) ud = parser->user_data;
     http_parser_init(parser);
+    parser->user_data = ud;
 }
 
 http_method_t http_method_from_string(const char *method) {
@@ -484,6 +489,7 @@ static void on_request_line(void *user_data, http_method_t method, const char *u
     } else {
         conn->keep_alive = 0;
     }
+    LOG(LOG_DEBUG, "on_request_line: uri=%s version=%s keep_alive=%d fd=%d", conn->uri, version?version:"(null)", conn->keep_alive, conn->sock);
 }
 
 
@@ -560,6 +566,7 @@ static void on_headers_complete(void *user_data) {
         } else if (strcasecmp(f, "Connection") == 0) {
             if (strcasecmp(v, "keep-alive") == 0) conn->keep_alive = 1;
             else conn->keep_alive = 0;
+            LOG(LOG_DEBUG, "on_headers_complete: Connection: %s -> keep_alive=%d fd=%d", v, conn->keep_alive, conn->sock);
         }
     }
 
@@ -595,6 +602,10 @@ int http_server_init(http_server_t *server, const char *ip, int port) {
         LOG(LOG_ERROR, "socket_create failed: %d", get_last_error());
         return -1;
     }
+    /* Ignore SIGPIPE so writing to closed sockets doesn't terminate process */
+#if !PLATFORM_WINDOWS
+    signal(SIGPIPE, SIG_IGN);
+#endif
     /* Allow quick reuse of address/port */
     {
         int opt = 1;
@@ -777,14 +788,14 @@ int http_conn_send_response(http_conn_t *conn, int status, const char *body) {
     int hlen = snprintf(header, sizeof(header), "HTTP/1.0 %d OK\r\nContent-Length: %zu\r\nContent-Type: text/plain\r\nConnection: %s\r\n\r\n", status, body_len, conn->keep_alive ? "keep-alive" : "close");
     if (hlen < 0 || hlen >= (int)sizeof(header)) return -1;
 
-    ssize_t sent = socket_send(conn->sock, header, hlen, 0);
+    ssize_t sent = socket_send_all(conn->sock, header, hlen);
     if (sent != hlen) {
         LOG(LOG_WARN, "send header failed on fd=%d: %zd/%d", conn->sock, sent, hlen);
         http_conn_close(conn);
         return -1;
     }
     if (body_len > 0) {
-        sent = socket_send(conn->sock, body, body_len, 0);
+        sent = socket_send_all(conn->sock, body, body_len);
         if (sent != (ssize_t)body_len) {
             LOG(LOG_WARN, "send body failed on fd=%d: %zd/%zu", conn->sock, sent, body_len);
             http_conn_close(conn);
@@ -794,10 +805,21 @@ int http_conn_send_response(http_conn_t *conn, int status, const char *body) {
 
     /* If keep-alive requested, reset parser and state for next request and keep socket open */
     if (conn->keep_alive) {
+        /* Prevent simple pipelining: if there's unread data buffered, close instead */
+        if (conn->read_len > 0) {
+            LOG(LOG_INFO, "pipelining detected, closing connection fd=%d", conn->sock);
+            http_conn_close(conn);
+            return 0;
+        }
+
         conn->last_active = get_time_ms();
         conn->header_count = 0;
         conn->body_len = 0;
         conn->expected_content_length = 0;
+        if (conn->upload_fp) {
+            fclose(conn->upload_fp);
+            conn->upload_fp = NULL;
+        }
         http_parser_reset(&conn->parser);
         return 0;
     }
@@ -853,6 +875,32 @@ ssize_t socket_recv(socket_t sock, void *buf, size_t len, int flags) {
 
 ssize_t socket_send(socket_t sock, const void *buf, size_t len, int flags) {
     return send(sock, buf, len, flags);
+}
+
+static ssize_t socket_send_all(socket_t sock, const void *buf, size_t len) {
+    size_t total = 0;
+    const char *p = (const char *)buf;
+    while (total < len) {
+        ssize_t n = socket_send(sock, p + total, len - total, 0);
+        if (n > 0) {
+            total += (size_t)n;
+            continue;
+        }
+        if (n == 0) return (ssize_t)total;
+        int err = get_last_error();
+        if (err == EAGAIN || err == EWOULDBLOCK) {
+            /* wait until socket writable */
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(sock, &wfds);
+            struct timeval tv = {1, 0};
+            int sel = select((int)sock + 1, NULL, &wfds, NULL, &tv);
+            if (sel <= 0) return -1;
+            continue;
+        }
+        return -1;
+    }
+    return (ssize_t)total;
 }
 
 int socket_close(socket_t sock) {
@@ -994,8 +1042,9 @@ int http_conn_send_file(http_conn_t *conn, int status, const char *path) {
                       "HTTP/1.0 %d OK\r\n"
                       "Content-Type: %s\r\n"
                       "Content-Length: %zu\r\n"
+                      "Connection: %s\r\n"
                       "\r\n",
-                      status, mime_type, content.size);
+                      status, mime_type, content.size, conn->keep_alive ? "keep-alive" : "close");
 
     if (len >= (int)sizeof(response)) {
         file_free(&content);
@@ -1003,7 +1052,7 @@ int http_conn_send_file(http_conn_t *conn, int status, const char *path) {
     }
 
     // Send header
-    ssize_t sent = socket_send(conn->sock, response, len, 0);
+    ssize_t sent = socket_send_all(conn->sock, response, len);
     if (sent != len) {
         file_free(&content);
         http_conn_close(conn);
@@ -1012,7 +1061,9 @@ int http_conn_send_file(http_conn_t *conn, int status, const char *path) {
 
     // Send file content
     size_t csize = content.size;
-    sent = socket_send(conn->sock, content.data, csize, 0);
+    /* reuse send-all helper defined in response function */
+    extern ssize_t socket_send_all(socket_t sock, const void *buf, size_t len);
+    sent = socket_send_all(conn->sock, content.data, csize);
     file_free(&content);
 
     if (sent != (ssize_t)csize) {
@@ -1063,22 +1114,24 @@ int http_conn_send_directory_listing(http_conn_t *conn, const char *path, const 
                       "HTTP/1.0 200 OK\r\n"
                       "Content-Type: text/html\r\n"
                       "Content-Length: %d\r\n"
+                      "Connection: %s\r\n"
                       "\r\n",
-                      html_len);
+                      html_len, conn->keep_alive ? "keep-alive" : "close");
 
     if (len >= (int)sizeof(response) || html_len >= (int)sizeof(html)) {
         return http_conn_send_response(conn, 500, "Directory listing too large");
     }
 
     // Send header
-    ssize_t sent = socket_send(conn->sock, response, len, 0);
+    ssize_t sent = socket_send_all(conn->sock, response, len);
     if (sent != len) {
         http_conn_close(conn);
         return -1;
     }
 
     // Send HTML content
-    sent = socket_send(conn->sock, html, html_len, 0);
+    extern ssize_t socket_send_all(socket_t sock, const void *buf, size_t len);
+    sent = socket_send_all(conn->sock, html, html_len);
     if (sent != html_len) {
         LOG(LOG_WARN, "send html failed on fd=%d: %zd/%d", conn->sock, sent, html_len);
         http_conn_close(conn);

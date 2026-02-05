@@ -21,11 +21,33 @@ static void request_handler(http_conn_t *conn, http_method_t method,
   LOG(LOG_INFO, "Request: %s -> %s", uri, normalized_path);
 
   // Convert to relative path for our server root
-  const char *rel_path = normalized_path;
-  while (*rel_path == '/')
-    rel_path++;
-  if (*rel_path == '\0')
-    rel_path = "index.html";
+  const char *p = normalized_path;
+  while (*p == '/')
+    p++;
+
+  char rel_path[MAX_URI_LEN];
+  if (*p == '\0') {
+    strcpy(rel_path, ".");
+  } else {
+    strncpy(rel_path, p, sizeof(rel_path) - 1);
+    rel_path[sizeof(rel_path) - 1] = '\0';
+  }
+
+  if (is_directory(rel_path)) {
+    char index_path[MAX_URI_LEN];
+    snprintf(index_path, sizeof(index_path), "%s/index.html", rel_path);
+
+    if (file_exists(index_path)) {
+      http_conn_send_file(conn, 200, index_path);
+    } else {
+#if DIRECTORY_LISTING
+      http_conn_send_directory_listing(conn, rel_path, uri);
+#else
+      http_conn_send_response(conn, 404, "Not found or access denied");
+#endif
+    }
+    return;
+  }
 
   if (path_is_safe(rel_path) && file_exists(rel_path)) {
     http_conn_send_file(conn, 200, rel_path);

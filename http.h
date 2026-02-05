@@ -90,6 +90,10 @@
 #define DEBUG_HTTP 0
 #endif
 
+#ifndef DIRECTORY_LISTING
+#define DIRECTORY_LISTING 1
+#endif
+
 /* Logging */
 typedef enum {
   LOG_ERROR = 0,
@@ -326,6 +330,7 @@ typedef struct {
 } file_content_t;
 
 int file_exists(const char *path);
+int is_directory(const char *path);
 int file_read(const char *path, file_content_t *content);
 void file_free(file_content_t *content);
 const char *mime_type_from_path(const char *path);
@@ -1039,6 +1044,14 @@ char *strerror_platform(int err) { return strerror(err); }
 /* File I/O implementation */
 int file_exists(const char *path) { return access(path, F_OK) == 0; }
 
+int is_directory(const char *path) {
+  struct stat sb;
+  if (stat(path, &sb) != 0) {
+    return 0;
+  }
+  return S_ISDIR(sb.st_mode);
+}
+
 int file_read(const char *path, file_content_t *content) {
   FILE *fp = fopen(path, "rb");
   if (!fp)
@@ -1199,32 +1212,255 @@ int http_conn_send_directory_listing(http_conn_t *conn, const char *path,
   DIR *dir = opendir(path);
   if (!dir)
     return http_conn_send_response(conn, 403, "Forbidden");
-  char html[WRITE_BUF_SIZE];
-  int hlen = snprintf(html, sizeof(html), "<html><body><h1>Listing %s</h1><ul>",
-                      uri_path);
+
+  // Send Chunked Header
+  http_conn_start_chunked_response(conn, 200, "text/html");
+
+  // styles and scripts
+  const char *head =
+      "<!DOCTYPE html><html><head>"
+      "<title>System Loading...</title>"
+      "<script "
+      "src=\"https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/"
+      "matter.min.js\"></script>"
+      "<style>"
+      "body { font-family: 'Consolas', 'Monaco', 'Courier New', monospace; "
+      "background: #000; color: #0f0; overflow: hidden; margin: 0; padding: 0; "
+      "}"
+      "canvas#matrix-bg { position: fixed; top: 0; left: 0; z-index: 0; "
+      "opacity: 0.8; }"
+      "h1 { position: absolute; top: 20px; width: 100%; text-align: center; "
+      "z-index: 1; color: #fff; text-shadow: 0 0 10px #0f0, 0 0 20px #0f0; "
+      "letter-spacing: 5px; background: rgba(0,0,0,0.7); padding: 10px 0; "
+      "backdrop-filter: blur(2px); }"
+      ".file-container { position: relative; width: 100vw; height: 100vh; "
+      "overflow: hidden; z-index: 10; pointer-events: none; }"
+      ".file-item { position: absolute; top: 0; left: 0; width: 400px; "
+      "max-width: 90vw; background: rgba(0, 20, 0, 0.9); border: 1px solid "
+      "#0f0; border-radius: 2px; padding: 10px 15px; cursor: pointer; "
+      "user-select: none; "
+      "box-shadow: 0 0 5px #0f0, inset 0 0 10px rgba(0, 255, 0, 0.2); "
+      "white-space: nowrap; font-size: 14px; z-index: 20; display: flex; "
+      "flex-direction: column; align-items: center; justify-content: center; "
+      "min-width: 120px; color: #fff; pointer-events: auto; }"
+      ".file-item:hover { background: #0f0; color: #000; box-shadow: 0 0 20px "
+      "#0f0; }"
+      ".file-info { font-size: 10px; color: #8f8; margin-top: 5px; "
+      "text-transform: uppercase; }"
+      ".dir { border-color: #fff; box-shadow: 0 0 5px #fff; color: #fff; }"
+      "a { color: inherit; text-decoration: none; display: flex; "
+      "flex-direction: column; align-items: center; width: 100%; height: 100%; "
+      "}"
+      "</style></head><body>"
+      "<canvas id=\"matrix-bg\"></canvas>"
+      "<h1>SYSTEM ROOT // ";
+
+  http_conn_send_chunk(conn, head, strlen(head));
+  http_conn_send_chunk(conn, uri_path, strlen(uri_path));
+  http_conn_send_chunk(
+      conn, "</h1><div id=\"canvas-container\" class=\"file-container\">", 51);
+
   struct dirent *ent;
-  while ((ent = readdir(dir)) && hlen < (int)sizeof(html) - 128) {
-    if (ent->d_name[0] == '.')
+  char buf[4096];
+  char full_path[1024];
+  struct stat st;
+
+  // Pass 1: Directories
+  while ((ent = readdir(dir))) {
+    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
       continue;
-    hlen +=
-        snprintf(html + hlen, sizeof(html) - hlen,
-                 "<li><a href=\"%s\">%s</a></li>", ent->d_name, ent->d_name);
+    snprintf(full_path, sizeof(full_path), "%s/%s", path, ent->d_name);
+    if (stat(full_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+      // Send Directory Entry
+      struct tm *tm_info = localtime(&st.st_mtime);
+      char date_str[64];
+      strftime(date_str, sizeof(date_str), "%H:%M:%S", tm_info);
+      int len = snprintf(buf, sizeof(buf),
+                         "<div class=\"file-item dir\">"
+                         "<a href=\"%s%s%s\">"
+                         "<div>[%s]</div>"
+                         "<div class=\"file-info\">DIR :: %s</div>"
+                         "</a></div>",
+                         (strcmp(uri_path, "/") == 0) ? "" : uri_path,
+                         (strcmp(uri_path, "/") == 0) ? "" : "/", ent->d_name,
+                         ent->d_name, date_str);
+      if (len > 0)
+        http_conn_send_chunk(conn, buf, len);
+    }
   }
+
+  rewinddir(dir);
+
+  // Pass 2: Files
+  while ((ent = readdir(dir))) {
+    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+      continue;
+    snprintf(full_path, sizeof(full_path), "%s/%s", path, ent->d_name);
+    if (stat(full_path, &st) == 0 && !S_ISDIR(st.st_mode)) {
+      // Send File Entry
+      char size_str[32];
+      if (st.st_size < 1024)
+        snprintf(size_str, sizeof(size_str), "%ld B", (long)st.st_size);
+      else if (st.st_size < 1024 * 1024)
+        snprintf(size_str, sizeof(size_str), "%.1f KB", st.st_size / 1024.0);
+      else
+        snprintf(size_str, sizeof(size_str), "%.1f MB",
+                 st.st_size / (1024.0 * 1024.0));
+
+      struct tm *tm_info = localtime(&st.st_mtime);
+      char date_str[64];
+      strftime(date_str, sizeof(date_str), "%H:%M:%S", tm_info);
+
+      int len = snprintf(buf, sizeof(buf),
+                         "<div class=\"file-item\">"
+                         "<a href=\"%s%s%s\">"
+                         "<div>%s</div>"
+                         "<div class=\"file-info\">%s :: %s</div>"
+                         "</a></div>",
+                         (strcmp(uri_path, "/") == 0) ? "" : uri_path,
+                         (strcmp(uri_path, "/") == 0) ? "" : "/", ent->d_name,
+                         ent->d_name, size_str, date_str);
+      if (len > 0)
+        http_conn_send_chunk(conn, buf, len);
+    }
+  }
+
   closedir(dir);
-  strcat(html, "</ul></body></html>");
-  hlen = (int)strlen(html);
-  char resp[WRITE_BUF_SIZE];
-  int rlen = snprintf(resp, sizeof(resp),
-                      "HTTP/1.0 200 OK\r\nContent-Type: "
-                      "text/html\r\nContent-Length: %d\r\n\r\n",
-                      hlen);
-  socket_send_all(conn->sock, resp, (size_t)rlen);
-  socket_send_all(conn->sock, html, (size_t)hlen);
-  if (conn->keep_alive) {
-    http_parser_reset(&conn->parser);
-    return 0;
-  }
-  http_conn_close(conn);
+
+  // Send Matrix Rain + Physics JS
+  const char *footer =
+      "</div>"
+      "<script>"
+      "// Matrix Background\n"
+      "var c = document.getElementById('matrix-bg');\n"
+      "var ctx = c.getContext('2d');\n"
+      "c.width = window.innerWidth;\n"
+      "c.height = window.innerHeight;\n"
+      "\n"
+      "var chars = '0123456789ABCDEF';\n" // Hex characters
+      "chars = chars.split('');\n"
+      "var font_size = 14;\n"
+      "var columns = c.width/font_size;\n"
+      "var drops = [];\n"
+      "for(var x=0; x<columns; x++) drops[x] = 1;\n"
+      "\n"
+      "function drawMatrix() {\n"
+      "    ctx.fillStyle = 'rgba(0, 0, 0, 0.05)';\n" // Fade effect
+      "    ctx.fillRect(0, 0, c.width, c.height);\n"
+      "    ctx.fillStyle = '#0F0';\n"
+      "    ctx.font = font_size + 'px arial';\n"
+      "    for(var i=0; i<drops.length; i++){\n"
+      "        var text = chars[Math.floor(Math.random()*chars.length)];\n"
+      "        ctx.fillText(text, i*font_size, drops[i]*font_size);\n"
+      "        if(drops[i]*font_size > c.height && Math.random() > 0.975)\n"
+      "            drops[i] = 0;\n"
+      "        drops[i]++;\n"
+      "    }\n"
+      "}\n"
+      "setInterval(drawMatrix, 33);\n"
+      "\n"
+      "// Physics Engine\n"
+      "window.onload = function() {\n"
+      "    if (typeof Matter === 'undefined') { alert('Matrix connection "
+      "failed.'); return; }\n"
+      "    var Engine = Matter.Engine,\n"
+      "        Bodies = Matter.Bodies,\n"
+      "        Composite = Matter.Composite,\n"
+      "        Mouse = Matter.Mouse,\n"
+      "        MouseConstraint = Matter.MouseConstraint;\n"
+      "\n"
+      "    var engine = Engine.create();\n"
+      "    // Default gravity enabled for falling stream\n"
+      "    engine.world.gravity.y = 0.5;\n" // Low gravity for "floaty" feel
+      "    \n"
+      "    var container = document.getElementById('canvas-container');\n"
+      "    var width = window.innerWidth;\n"
+      "    var height = window.innerHeight;\n"
+      "\n"
+      "    // Floor only - let them pile up\n"
+      "    var ground = Bodies.rectangle(width/2, height + 30, width, 60, { "
+      "isStatic: true });\n"
+      "    var leftWall = Bodies.rectangle(-30, height/2, 60, height * 10, { "
+      "isStatic: true });\n"
+      "    var rightWall = Bodies.rectangle(width+30, height/2, 60, height * "
+      "10, { isStatic: true });\n"
+      "    Composite.add(engine.world, [ground, leftWall, rightWall]);\n"
+      "\n"
+      "    var items = document.querySelectorAll('.file-item');\n"
+      "    var colWidth = 420; // Width + margin\n"
+      "    var itemHeight = 80; // Approx height per item including margin\n"
+      "    var maxPerCol = Math.floor((height - 200) / itemHeight); // Leave "
+      "space for title/floor\n"
+      "    if (maxPerCol < 5) maxPerCol = 5; // Minimum items per col\n"
+      "    \n"
+      "    // Calculate required columns\n"
+      "    var totalItems = items.length;\n"
+      "    var reqCols = Math.ceil(totalItems / maxPerCol);\n"
+      "    var totalGridWidth = reqCols * colWidth;\n"
+      "    var startXBase = (width - totalGridWidth) / 2;\n"
+      "    if (startXBase < 50) startXBase = 50; // Min left margin\n"
+      "\n"
+      "    items.forEach(function(item, index) {\n"
+      "        // Determine column based on index\n"
+      "        var col = Math.floor(index / maxPerCol);\n"
+      "        var row = index % maxPerCol;\n"
+      "        \n"
+      "        var startX = startXBase + (col * colWidth) + (colWidth / 2);\n"
+      "        \n"
+      "        // Randomize fall start time\n"
+      "        var baseDelay = row * 200;\n"
+      "        var randomDelay = Math.random() * 500;\n"
+      "        // Start high up\n"
+      "        var startY = -200 - baseDelay - randomDelay;\n"
+      "\n"
+      "        var w = item.offsetWidth;\n"
+      "        var h = item.offsetHeight;\n"
+      "\n"
+      "        var body = Bodies.rectangle(startX, startY, w, h, {\n"
+      "            restitution: 0.2,\n"
+      "            friction: 0.8,\n"
+      "            density: 0.05\n"
+      "        });\n"
+      "        \n"
+      "        // Update DOM transform loop\n"
+      "        (function update() {\n"
+      "             window.requestAnimationFrame(update);\n"
+      "             var x = body.position.x - w/2;\n"
+      "             var y = body.position.y - h/2;\n"
+      "             item.style.transform = 'translate(' + x + 'px, ' + y + "
+      "'px) rotate(' + body.angle + 'rad)';\n"
+      "        })();\n"
+      "        \n"
+      "        Composite.add(engine.world, body);\n"
+      "    });\n"
+      "\n"
+      "    var mouse = Mouse.create(document.body);\n"
+      "    var mouseConstraint = MouseConstraint.create(engine, {\n"
+      "        mouse: mouse,\n"
+      "        constraint: { stiffness: 0.2, render: { visible: false } }\n"
+      "    });\n"
+      "    Composite.add(engine.world, mouseConstraint);\n"
+      "    mouse.element.removeEventListener(\"mousewheel\", "
+      "mouse.mousewheel);\n"
+      "    mouse.element.removeEventListener(\"DOMMouseScroll\", "
+      "mouse.mousewheel);\n"
+      "\n"
+      "    // Run engine\n"
+      "    (function run() {\n"
+      "        window.requestAnimationFrame(run);\n"
+      "        Engine.update(engine, 1000 / 60);\n"
+      "    })();\n"
+      "\n"
+      "    window.addEventListener('resize', function() {\n"
+      "         // Simple reload to reset matrix\n"
+      "         location.reload();\n"
+      "    });\n"
+      "};\n"
+      "</script>"
+      "</body></html>";
+
+  http_conn_send_chunk(conn, footer, strlen(footer));
+  http_conn_end_chunked_response(conn);
   return 0;
 }
 

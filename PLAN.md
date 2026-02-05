@@ -29,7 +29,7 @@ Build a memory-efficient HTTP server using event-driven architecture, streaming 
 18. Docs, examples, and release packaging
 
 ## Verification
-- Unit tests: `./tests/keepalive_test.sh` verifies keep-alive; `./tests/security_test.sh` verifies traversal protection.
+- Unit tests: all tests pass
 - Integration: `curl http://localhost:8080/` serves `index.html` and file listing.
 - Uploads: large POSTs stream to temp file under `SERVE_PATH`.
 - Cross-platform: Builds on macOS and Linux (POSIX).

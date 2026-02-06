@@ -136,6 +136,27 @@ TEST_SUITE("Server") {
       http_conn_end_chunked_response(&conn);
       http_conn_send_directory_listing(&conn, ".", "/");
 
+      // HEAD method test: create a small file and ensure headers are sent but no body
+      FILE *hf = fopen("head_test.txt", "w");
+      fputs("ABCDEF", hf);
+      fclose(hf);
+      handler_called = 0;
+      conn.method = HTTP_METHOD_HEAD;
+      conn.keep_alive = 0;
+      // send file via HEAD
+      http_conn_send_file(&conn, 200, "head_test.txt");
+      // read response from peer
+      char buf[1024];
+      ssize_t r = read(sv[1], buf, sizeof(buf));
+      CHECK(r > 0);
+      std::string resp(buf, buf + (size_t)r);
+      CHECK(resp.find("Content-Length: 6") != std::string::npos);
+      // After headers, there should be no body data
+      CHECK(resp.find("\r\n\r\n") != std::string::npos);
+      size_t hdr_end = resp.find("\r\n\r\n") + 4;
+      CHECK_EQ(resp.size(), hdr_end);
+      unlink("head_test.txt");
+
       close(sv[1]);
       http_conn_close(&conn);
     }

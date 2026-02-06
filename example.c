@@ -14,7 +14,7 @@ static void request_handler(http_conn_t *conn, http_method_t method,
   char normalized_path[MAX_URI_LEN];
   if (path_normalize(normalized_path, decoded_uri, sizeof(normalized_path)) !=
       0) {
-    http_conn_send_response(conn, 403, "Not found or access denied");
+    http_conn_send_error(conn, 403, "Forbidden or path normalization failed");
     return;
   }
 
@@ -33,7 +33,45 @@ static void request_handler(http_conn_t *conn, http_method_t method,
     rel_path[sizeof(rel_path) - 1] = '\0';
   }
 
+  if (method == HTTP_METHOD_PUT) {
+    if (!path_is_safe(rel_path)) {
+      http_conn_send_error(conn, 403, "Forbidden");
+      return;
+    }
+    FILE *fp = fopen(rel_path, "wb");
+    if (!fp) {
+      http_conn_send_error(conn, 500, "Internal Server Error");
+      return;
+    }
+    fwrite(conn->body_buf, 1, conn->body_len, fp);
+    fclose(fp);
+    http_conn_send_response(conn, 201, "Created");
+    return;
+  }
+
+  if (method == HTTP_METHOD_DELETE) {
+    if (!path_is_safe(rel_path)) {
+      http_conn_send_error(conn, 403, "Forbidden");
+      return;
+    }
+    if (remove(rel_path) == 0) {
+      http_conn_send_response(conn, 200, "Deleted");
+    } else {
+      http_conn_send_error(conn, 404, "Not Found");
+    }
+    return;
+  }
+
   if (is_directory(rel_path)) {
+    // Redirect if missing trailing slash
+    size_t uri_len = strlen(uri);
+    if (uri_len > 0 && uri[uri_len - 1] != '/') {
+      char redir[MAX_URI_LEN];
+      snprintf(redir, sizeof(redir), "%s/", uri);
+      http_conn_send_redirect(conn, 301, redir);
+      return;
+    }
+
     char index_path[MAX_URI_LEN];
     snprintf(index_path, sizeof(index_path), "%s/index.html", rel_path);
 
@@ -43,7 +81,7 @@ static void request_handler(http_conn_t *conn, http_method_t method,
 #if DIRECTORY_LISTING
       http_conn_send_directory_listing(conn, rel_path, uri);
 #else
-      http_conn_send_response(conn, 404, "Not found or access denied");
+      http_conn_send_error(conn, 404, "Not Found");
 #endif
     }
     return;
@@ -58,7 +96,7 @@ static void request_handler(http_conn_t *conn, http_method_t method,
     http_conn_send_chunk(conn, "Chunk 3\n", 8);
     http_conn_end_chunked_response(conn);
   } else {
-    http_conn_send_response(conn, 404, "Not found or access denied");
+    http_conn_send_error(conn, 404, "Not Found");
   }
 }
 

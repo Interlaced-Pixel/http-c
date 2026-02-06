@@ -62,6 +62,27 @@ TEST_SUITE("Utils") {
              "application/octet-stream");
   }
 
+  TEST_CASE("http_date formatting and parsing") {
+    struct tm tm = {0};
+    tm.tm_year = 1994 - 1900;
+    tm.tm_mon = 10; // Nov
+    tm.tm_mday = 6;
+    tm.tm_hour = 8;
+    tm.tm_min = 49;
+    tm.tm_sec = 37;
+#if PLATFORM_WINDOWS
+    time_t t = _mkgmtime(&tm);
+#else
+    time_t t = timegm(&tm);
+#endif
+    char buf[64];
+    CHECK_EQ(http_format_date(buf, sizeof(buf), t), 0);
+    CHECK_EQ(std::string(buf), "Sun, 06 Nov 1994 08:49:37 GMT");
+    time_t parsed = http_parse_date(buf);
+    CHECK(parsed != (time_t)-1);
+    CHECK_EQ(parsed, t);
+  }
+
   TEST_CASE("http_method conversion") {
     CHECK_EQ(http_method_from_string("GET"), HTTP_METHOD_GET);
     CHECK_EQ(http_method_from_string("POST"), HTTP_METHOD_POST);

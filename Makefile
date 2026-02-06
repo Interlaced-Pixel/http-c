@@ -21,7 +21,7 @@ $(BUILD_DIR)/example.o: example.c http.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Test target using doctest (C++)
-TEST_SRCS = tests/test_runner.cpp tests/test_utils.cpp tests/test_mem_pool.cpp tests/test_parser.cpp tests/test_server.cpp
+TEST_SRCS = tests/test_runner.cpp tests/test_utils.cpp tests/test_status.cpp tests/test_mem_pool.cpp tests/test_parser.cpp tests/test_server.cpp
 HTTP_IMPL_OBJ = $(BUILD_DIR)/http_impl.o
 
 $(BUILD_DIR)/unit_tests: $(TEST_SRCS) $(HTTP_IMPL_OBJ) http.h | $(BUILD_DIR)

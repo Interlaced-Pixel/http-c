@@ -20,12 +20,12 @@ $(BUILD_DIR)/example: $(BUILD_DIR)/example.o
 $(BUILD_DIR)/example.o: example.c http.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Test target using doctest (C++)
-TEST_SRCS = tests/test_runner.cpp tests/test_utils.cpp tests/test_status.cpp tests/test_mem_pool.cpp tests/test_parser.cpp tests/test_server.cpp
+# Test target using custom C framework
+TEST_SRCS = tests/test_runner.c tests/test_utils.c tests/test_status.c tests/test_mem_pool.c tests/test_parser.c tests/test_server.c tests/globals.c
 HTTP_IMPL_OBJ = $(BUILD_DIR)/http_impl.o
 
 $(BUILD_DIR)/unit_tests: $(TEST_SRCS) $(HTTP_IMPL_OBJ) http.h | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) $(COVERAGE_FLAGS) -o $@ $(TEST_SRCS) $(HTTP_IMPL_OBJ) $(LDFLAGS)
+	$(CC) $(CFLAGS) $(COVERAGE_FLAGS) -o $@ $(TEST_SRCS) $(HTTP_IMPL_OBJ) $(LDFLAGS)
 
 $(BUILD_DIR)/http_impl.o: tests/http_impl.c http.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(COVERAGE_FLAGS) -c $< -o $@
@@ -44,6 +44,8 @@ coverage: $(BUILD_DIR)/unit_tests
 	@grep "File 'http.h'" -A 1 $(BUILD_DIR)/http.h.gcov || true
 
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf $(BUILD_DIR) *.o *.gcno *.gcda *.gcov
 
-.PHONY: all test clean coverage
+check: test
+
+.PHONY: all test clean coverage check

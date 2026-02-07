@@ -1,6 +1,23 @@
 #ifndef HTTP_H
 #define HTTP_H
 
+/* Feature test macros for POSIX/GNU extensions */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+#ifndef _BSD_SOURCE
+#define _BSD_SOURCE
+#endif
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE
+#endif
+
 /*
  * HTTP-C: Single-header HTTP server library for embedded systems
  *
@@ -146,8 +163,11 @@ typedef enum {
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <strings.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 #define SOCKET_ERROR -1
@@ -317,7 +337,6 @@ int socket_connect(socket_t sock, const struct sockaddr *addr,
 int socket_nonblocking(socket_t sock);
 ssize_t socket_recv(socket_t sock, void *buf, size_t len, int flags);
 ssize_t socket_send(socket_t sock, const void *buf, size_t len, int flags);
-static ssize_t socket_send_all(socket_t sock, const void *buf, size_t len);
 int socket_close(socket_t sock);
 unsigned long get_time_ms(void);
 int get_last_error(void);
@@ -342,6 +361,9 @@ int path_is_safe(const char *path);
 int http_conn_send_file(http_conn_t *conn, int status, const char *path);
 int http_conn_send_directory_listing(http_conn_t *conn, const char *path,
                                      const char *uri_path);
+int http_conn_send_error(http_conn_t *conn, int status, const char *msg);
+int http_conn_send_redirect(http_conn_t *conn, int status,
+                            const char *location);
 
 #ifndef HTTP_SERVER_NAME
 #define HTTP_SERVER_NAME "HTTP-C/1.0"
@@ -356,6 +378,8 @@ time_t http_parse_date(const char *str);
 #ifdef HTTP_IMPLEMENTATION
 
 /* Utility implementation */
+static ssize_t socket_send_all(socket_t sock, const void *buf, size_t len);
+
 char *strdup_safe(const char *s) {
   if (!s)
     return NULL;
@@ -1656,8 +1680,35 @@ int http_conn_end_chunked_response(http_conn_t *conn) {
   socket_send_all(conn->sock, "0\r\n\r\n", 5);
   if (conn->keep_alive)
     http_parser_reset(&conn->parser);
-  else
-    http_conn_close(conn);
+  return 0;
+}
+
+int http_conn_send_error(http_conn_t *conn, int status, const char *msg) {
+  char body[1024];
+  snprintf(body, sizeof(body), "Error %d: %s\n", status, msg);
+  return http_conn_send_response(conn, status, body);
+}
+
+int http_conn_send_redirect(http_conn_t *conn, int status,
+                            const char *location) {
+  char headers[MAX_HEADER_FIELD_LEN + MAX_HEADER_VALUE_LEN];
+  snprintf(headers, sizeof(headers), "Location: %s\r\n", location);
+
+  char response[WRITE_BUF_SIZE];
+  int hlen =
+      http_build_response_headers(response, sizeof(response), "HTTP/1.1",
+                                  status, NULL, 0, conn->keep_alive, headers);
+  if (hlen > 0 && hlen < (int)sizeof(response)) {
+    socket_send_all(conn->sock, response, (size_t)hlen);
+  }
+
+  if (conn->keep_alive) {
+    conn->header_count = 0;
+    conn->body_len = 0;
+    http_parser_reset(&conn->parser);
+    return 0;
+  }
+  http_conn_close(conn);
   return 0;
 }
 

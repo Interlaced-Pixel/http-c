@@ -900,58 +900,92 @@ static int http_build_response_headers(char *buf, size_t buf_size,
   if (http_format_date(date, sizeof(date), time(NULL)) < 0)
     return -1;
   const char *ctype = content_type ? content_type : "application/octet-stream";
-  int hlen = snprintf(buf, buf_size, "%s %d %s\r\nDate: %s\r\nServer: %s\r\nContent-Type: %s\r\n",
-                      version, status, http_status_reason(status),
-                      date, HTTP_SERVER_NAME, ctype);
-  if (hlen < 0 || hlen >= (int)buf_size) return -1;
+  int hlen = snprintf(
+      buf, buf_size,
+      "%s %d %s\r\nDate: %s\r\nServer: %s\r\nContent-Type: %s\r\n", version,
+      status, http_status_reason(status), date, HTTP_SERVER_NAME, ctype);
+  if (hlen < 0 || hlen >= (int)buf_size)
+    return -1;
   size_t remaining = buf_size - (size_t)hlen;
   char *p = buf + hlen;
   int n;
   if (content_length != (size_t)-1) {
     n = snprintf(p, remaining, "Content-Length: %zu\r\n", content_length);
-    if (n < 0 || n >= (int)remaining) return -1;
-    p += n; remaining -= n; hlen += n;
+    if (n < 0 || n >= (int)remaining)
+      return -1;
+    p += n;
+    remaining -= n;
+    hlen += n;
   }
-  n = snprintf(p, remaining, "Connection: %s\r\n", keep_alive ? "keep-alive" : "close");
-  if (n < 0 || n >= (int)remaining) return -1;
-  p += n; remaining -= n; hlen += n;
+  n = snprintf(p, remaining, "Connection: %s\r\n",
+               keep_alive ? "keep-alive" : "close");
+  if (n < 0 || n >= (int)remaining)
+    return -1;
+  p += n;
+  remaining -= n;
+  hlen += n;
   if (extra_headers) {
     n = snprintf(p, remaining, "%s", extra_headers);
-    if (n < 0 || n >= (int)remaining) return -1;
-    p += n; remaining -= n; hlen += n;
+    if (n < 0 || n >= (int)remaining)
+      return -1;
+    p += n;
+    remaining -= n;
+    hlen += n;
   }
   n = snprintf(p, remaining, "\r\n");
-  if (n < 0 || n >= (int)remaining) return -1;
+  if (n < 0 || n >= (int)remaining)
+    return -1;
   hlen += n;
   return hlen;
 }
 
 const char *http_status_reason(int status) {
   switch (status) {
-  case 200: return "OK";
-  case 201: return "Created";
-  case 202: return "Accepted";
-  case 204: return "No Content";
-  case 301: return "Moved Permanently";
-  case 302: return "Moved Temporarily";
-  case 304: return "Not Modified";
-  case 400: return "Bad Request";
-  case 401: return "Unauthorized";
-  case 403: return "Forbidden";
-  case 404: return "Not Found";
-  case 500: return "Internal Server Error";
-  case 501: return "Not Implemented";
-  case 502: return "Bad Gateway";
-  case 503: return "Service Unavailable";
+  case 200:
+    return "OK";
+  case 201:
+    return "Created";
+  case 202:
+    return "Accepted";
+  case 204:
+    return "No Content";
+  case 301:
+    return "Moved Permanently";
+  case 302:
+    return "Moved Temporarily";
+  case 304:
+    return "Not Modified";
+  case 400:
+    return "Bad Request";
+  case 401:
+    return "Unauthorized";
+  case 403:
+    return "Forbidden";
+  case 404:
+    return "Not Found";
+  case 500:
+    return "Internal Server Error";
+  case 501:
+    return "Not Implemented";
+  case 502:
+    return "Bad Gateway";
+  case 503:
+    return "Service Unavailable";
   default: {
     int cls = status / 100;
     switch (cls) {
-    case 1: return "Informational";
-    case 2: return "Success";
-    case 3: return "Redirection";
-    case 4: return "Client Error";
-    case 5: return "Server Error";
-    default: return "Unknown";
+    case 1:
+      return "Informational";
+    case 2:
+      return "Success";
+    case 3:
+      return "Redirection";
+    case 4:
+      return "Client Error";
+    case 5:
+      return "Server Error";
+    default:
+      return "Unknown";
     }
   }
   }
@@ -960,9 +994,11 @@ const char *http_status_reason(int status) {
 int http_format_date(char *buf, size_t buf_size, time_t t) {
   struct tm tm;
 #if PLATFORM_WINDOWS
-  if (gmtime_s(&tm, &t) != 0) return -1;
+  if (gmtime_s(&tm, &t) != 0)
+    return -1;
 #else
-  if (gmtime_r(&t, &tm) == NULL) return -1;
+  if (gmtime_r(&t, &tm) == NULL)
+    return -1;
 #endif
   if (strftime(buf, buf_size, "%a, %d %b %Y %H:%M:%S GMT", &tm) == 0)
     return -1;
@@ -1303,9 +1339,9 @@ int http_conn_send_file(http_conn_t *conn, int status, const char *path) {
     return http_conn_send_response(conn, 404, "File not found");
   const char *mime = mime_type_from_path(path);
   char resp[WRITE_BUF_SIZE];
-  int hlen = http_build_response_headers(resp, sizeof(resp), "HTTP/1.0",
-                                         status, mime, content.size,
-                                         conn->keep_alive, NULL);
+  int hlen =
+      http_build_response_headers(resp, sizeof(resp), "HTTP/1.0", status, mime,
+                                  content.size, conn->keep_alive, NULL);
   if (hlen < 0 || hlen >= (int)sizeof(resp)) {
     file_free(&content);
     return -1;
@@ -1317,7 +1353,8 @@ int http_conn_send_file(http_conn_t *conn, int status, const char *path) {
   }
   /* For HEAD requests, do not send the entity body */
   if (conn->method != HTTP_METHOD_HEAD) {
-    if (socket_send_all(conn->sock, content.data, content.size) != (ssize_t)content.size) {
+    if (socket_send_all(conn->sock, content.data, content.size) !=
+        (ssize_t)content.size) {
       file_free(&content);
       http_conn_close(conn);
       return -1;
@@ -1594,9 +1631,9 @@ int http_conn_send_directory_listing(http_conn_t *conn, const char *path,
 int http_conn_start_chunked_response(http_conn_t *conn, int status,
                                      const char *content_type) {
   char h[WRITE_BUF_SIZE];
-  int hlen = http_build_response_headers(h, sizeof(h), "HTTP/1.1",
-                                         status, content_type, (size_t)-1,
-                                         conn->keep_alive, "Transfer-Encoding: chunked\r\n");
+  int hlen = http_build_response_headers(
+      h, sizeof(h), "HTTP/1.1", status, content_type, (size_t)-1,
+      conn->keep_alive, "Transfer-Encoding: chunked\r\n");
   if (hlen < 0 || hlen >= (int)sizeof(h))
     return -1;
   if (socket_send_all(conn->sock, h, (size_t)hlen) != (ssize_t)hlen) {

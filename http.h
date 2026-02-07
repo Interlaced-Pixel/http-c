@@ -250,16 +250,9 @@ void http_parser_reset(http_parser_t *parser);
 http_method_t http_method_from_string(const char *method);
 const char *http_method_to_string(http_method_t method);
 
-#ifndef HTTP_AUTH_REALM
-#define HTTP_AUTH_REALM "Restricted"
-#endif
-
 /* HTTP server */
 typedef struct http_conn http_conn_t;
 typedef struct http_server http_server_t;
-
-typedef int (*http_auth_cb)(const char *username, const char *password,
-                            void *user_data);
 
 typedef struct {
   char field[MAX_HEADER_FIELD_LEN];
@@ -281,8 +274,6 @@ struct http_conn {
   http_method_t method;
   char uri[256];
   void (*on_request)(http_conn_t *conn, http_method_t method, const char *uri);
-  http_server_t *server;
-  char remote_ip[64];
   /* Body buffering for requests with Content-Length */
   char body_buf[READ_BUF_SIZE];
   size_t body_len;
@@ -290,9 +281,6 @@ struct http_conn {
   /* Upload streaming to temp file when body is large */
   FILE *upload_fp;
   char upload_path[256];
-  time_t if_modified_since;
-  char auth_header[256];
-  int pragma_no_cache;
 };
 
 struct http_server {
@@ -300,23 +288,15 @@ struct http_server {
   http_conn_t connections[MAX_CONNECTIONS];
   int conn_count;
   volatile int running;
-  http_auth_cb auth_cb;
-  void *auth_data;
 };
 
 int http_server_init(http_server_t *server, const char *ip, int port);
 void http_server_run(http_server_t *server);
 void http_server_stop(http_server_t *server);
 void http_server_close(http_server_t *server);
-void http_server_set_auth_handler(http_server_t *server, http_auth_cb cb,
-                                  void *user_data);
 void http_conn_init(http_conn_t *conn);
-void http_conn_reset(http_conn_t *conn);
 void http_conn_close(http_conn_t *conn);
 int http_conn_send_response(http_conn_t *conn, int status, const char *body);
-int http_conn_send_error(http_conn_t *conn, int status, const char *detail);
-int http_conn_send_redirect(http_conn_t *conn, int status,
-                            const char *location);
 int http_conn_start_chunked_response(http_conn_t *conn, int status,
                                      const char *content_type);
 int http_conn_send_chunk(http_conn_t *conn, const char *data, size_t len);
@@ -376,38 +356,6 @@ time_t http_parse_date(const char *str);
 #ifdef HTTP_IMPLEMENTATION
 
 /* Utility implementation */
-static const char base64_table[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-static int base64_decode(const char *in, size_t in_len, char *out,
-                         size_t out_size) {
-  unsigned int v = 0;
-  int bits = -8;
-  size_t j = 0;
-  int table[256];
-  memset(table, -1, sizeof(table));
-  for (int i = 0; i < 64; i++)
-    table[(unsigned char)base64_table[i]] = i;
-
-  for (size_t i = 0; i < in_len; i++) {
-    if (table[(unsigned char)in[i]] == -1) {
-      if (in[i] == '=')
-        break;
-      continue;
-    }
-    v = (v << 6) | (unsigned int)table[(unsigned char)in[i]];
-    bits += 6;
-    if (bits >= 0) {
-      if (j >= out_size - 1)
-        return -1;
-      out[j++] = (char)((v >> bits) & 0xFF);
-      bits -= 8;
-    }
-  }
-  out[j] = '\0';
-  return (int)j;
-}
-
 char *strdup_safe(const char *s) {
   if (!s)
     return NULL;
@@ -646,11 +594,6 @@ static void on_header(void *user_data, const char *field, const char *value) {
     conn->headers[conn->header_count].value[MAX_HEADER_VALUE_LEN - 1] = '\0';
     conn->header_count++;
   }
-
-  if (strcasecmp(field, "Authorization") == 0) {
-    strncpy(conn->auth_header, value, sizeof(conn->auth_header) - 1);
-    conn->auth_header[sizeof(conn->auth_header) - 1] = '\0';
-  }
 }
 
 static void on_body(void *user_data, const char *data, size_t len) {
@@ -725,25 +668,7 @@ static void on_headers_complete(void *user_data) {
       LOG(LOG_DEBUG,
           "on_headers_complete: Connection: %s -> keep_alive=%d fd=%d", v,
           conn->keep_alive, conn->sock);
-    } else if (strcasecmp(f, "If-Modified-Since") == 0) {
-      conn->if_modified_since = http_parse_date(v);
-    } else if (strcasecmp(f, "Pragma") == 0) {
-      if (strcasecmp(v, "no-cache") == 0)
-        conn->pragma_no_cache = 1;
     }
-  }
-
-  /* Content-Length validation for POST/PUT */
-  if ((conn->method == HTTP_METHOD_POST || conn->method == HTTP_METHOD_PUT) &&
-      conn->expected_content_length == 0) {
-    LOG(LOG_WARN, "POST/PUT request missing Content-Length from fd=%d",
-        conn->sock);
-    /* In HTTP/1.0, Content-Length is required for methods with a body */
-    http_conn_send_error(conn, 400, "Content-Length required for POST/PUT");
-  }
-
-  if (conn->pragma_no_cache) {
-    conn->if_modified_since = 0;
   }
 }
 
@@ -754,53 +679,6 @@ static void on_complete(void *user_data) {
   /* Only call on_request when full body received */
   if (conn->expected_content_length == 0 ||
       conn->body_len >= conn->expected_content_length) {
-
-    /* Perform Authentication Check */
-    if (conn->server && conn->server->auth_cb) {
-      int authorized = 0;
-      if (strlen(conn->auth_header) > 6 &&
-          strncasecmp(conn->auth_header, "Basic ", 6) == 0) {
-        char decoded[MAX_HEADER_VALUE_LEN];
-        if (base64_decode(conn->auth_header + 6, strlen(conn->auth_header + 6),
-                          decoded, sizeof(decoded)) > 0) {
-          char *colon = strchr(decoded, ':');
-          if (colon) {
-            *colon = '\0';
-            const char *username = decoded;
-            const char *password = colon + 1;
-            if (conn->server->auth_cb(username, password,
-                                      conn->server->auth_data)) {
-              authorized = 1;
-            }
-          }
-        }
-      }
-
-      if (!authorized) {
-        char extra[128];
-        snprintf(extra, sizeof(extra),
-                 "WWW-Authenticate: Basic realm=\"%s\"\r\n", HTTP_AUTH_REALM);
-
-        char header[WRITE_BUF_SIZE];
-        int hlen = http_build_response_headers(header, sizeof(header),
-                                               "HTTP/1.0", 401, "text/plain",
-                                               12, conn->keep_alive, extra);
-        if (hlen > 0 && hlen < (int)sizeof(header)) {
-          socket_send_all(conn->sock, header, (size_t)hlen);
-          if (conn->method != HTTP_METHOD_HEAD) {
-            socket_send_all(conn->sock, "Unauthorized", 12);
-          }
-        }
-
-        if (conn->keep_alive) {
-          http_conn_reset(conn);
-        } else {
-          http_conn_close(conn);
-        }
-        return;
-      }
-    }
-
     if (conn->on_request)
       conn->on_request(conn, conn->method, conn->uri);
     /* close upload file if open */
@@ -912,10 +790,6 @@ void http_server_run(http_server_t *server) {
           if (server->connections[i].sock == INVALID_SOCKET) {
             server->connections[i].sock = client_sock;
             server->connections[i].last_active = get_time_ms();
-            server->connections[i].server = server;
-            inet_ntop(AF_INET, &client_addr.sin_addr,
-                      server->connections[i].remote_ip,
-                      sizeof(server->connections[i].remote_ip));
             server->conn_count++;
             added = 1;
             break;
@@ -1006,18 +880,8 @@ void http_conn_init(http_conn_t *conn) {
   conn->parser_settings.on_body = on_body;
   conn->parser_settings.on_headers_complete = on_headers_complete;
   conn->parser_settings.on_complete = on_complete;
-  http_conn_reset(conn);
-}
-
-void http_conn_reset(http_conn_t *conn) {
-  conn->header_count = 0;
   conn->body_len = 0;
   conn->expected_content_length = 0;
-  conn->if_modified_since = 0;
-  conn->pragma_no_cache = 0;
-  conn->upload_fp = NULL;
-  conn->upload_path[0] = '\0';
-  http_parser_reset(&conn->parser);
 }
 
 void http_conn_close(http_conn_t *conn) {
@@ -1036,92 +900,58 @@ static int http_build_response_headers(char *buf, size_t buf_size,
   if (http_format_date(date, sizeof(date), time(NULL)) < 0)
     return -1;
   const char *ctype = content_type ? content_type : "application/octet-stream";
-  int hlen = snprintf(
-      buf, buf_size,
-      "%s %d %s\r\nDate: %s\r\nServer: %s\r\nContent-Type: %s\r\n", version,
-      status, http_status_reason(status), date, HTTP_SERVER_NAME, ctype);
-  if (hlen < 0 || hlen >= (int)buf_size)
-    return -1;
+  int hlen = snprintf(buf, buf_size, "%s %d %s\r\nDate: %s\r\nServer: %s\r\nContent-Type: %s\r\n",
+                      version, status, http_status_reason(status),
+                      date, HTTP_SERVER_NAME, ctype);
+  if (hlen < 0 || hlen >= (int)buf_size) return -1;
   size_t remaining = buf_size - (size_t)hlen;
   char *p = buf + hlen;
   int n;
   if (content_length != (size_t)-1) {
     n = snprintf(p, remaining, "Content-Length: %zu\r\n", content_length);
-    if (n < 0 || n >= (int)remaining)
-      return -1;
-    p += n;
-    remaining -= n;
-    hlen += n;
+    if (n < 0 || n >= (int)remaining) return -1;
+    p += n; remaining -= n; hlen += n;
   }
-  n = snprintf(p, remaining, "Connection: %s\r\n",
-               keep_alive ? "keep-alive" : "close");
-  if (n < 0 || n >= (int)remaining)
-    return -1;
-  p += n;
-  remaining -= n;
-  hlen += n;
+  n = snprintf(p, remaining, "Connection: %s\r\n", keep_alive ? "keep-alive" : "close");
+  if (n < 0 || n >= (int)remaining) return -1;
+  p += n; remaining -= n; hlen += n;
   if (extra_headers) {
     n = snprintf(p, remaining, "%s", extra_headers);
-    if (n < 0 || n >= (int)remaining)
-      return -1;
-    p += n;
-    remaining -= n;
-    hlen += n;
+    if (n < 0 || n >= (int)remaining) return -1;
+    p += n; remaining -= n; hlen += n;
   }
   n = snprintf(p, remaining, "\r\n");
-  if (n < 0 || n >= (int)remaining)
-    return -1;
+  if (n < 0 || n >= (int)remaining) return -1;
   hlen += n;
   return hlen;
 }
 
 const char *http_status_reason(int status) {
   switch (status) {
-  case 200:
-    return "OK";
-  case 201:
-    return "Created";
-  case 202:
-    return "Accepted";
-  case 204:
-    return "No Content";
-  case 301:
-    return "Moved Permanently";
-  case 302:
-    return "Moved Temporarily";
-  case 304:
-    return "Not Modified";
-  case 400:
-    return "Bad Request";
-  case 401:
-    return "Unauthorized";
-  case 403:
-    return "Forbidden";
-  case 404:
-    return "Not Found";
-  case 500:
-    return "Internal Server Error";
-  case 501:
-    return "Not Implemented";
-  case 502:
-    return "Bad Gateway";
-  case 503:
-    return "Service Unavailable";
+  case 200: return "OK";
+  case 201: return "Created";
+  case 202: return "Accepted";
+  case 204: return "No Content";
+  case 301: return "Moved Permanently";
+  case 302: return "Moved Temporarily";
+  case 304: return "Not Modified";
+  case 400: return "Bad Request";
+  case 401: return "Unauthorized";
+  case 403: return "Forbidden";
+  case 404: return "Not Found";
+  case 500: return "Internal Server Error";
+  case 501: return "Not Implemented";
+  case 502: return "Bad Gateway";
+  case 503: return "Service Unavailable";
   default: {
     int cls = status / 100;
     switch (cls) {
-    case 1:
-      return "Informational";
-    case 2:
-      return "Success";
-    case 3:
-      return "Redirection";
-    case 4:
-      return "Client Error";
-    case 5:
-      return "Server Error";
-    default:
-      return "Unknown";
+    case 1: return "Informational";
+    case 2: return "Success";
+    case 3: return "Redirection";
+    case 4: return "Client Error";
+    case 5: return "Server Error";
+    default: return "Unknown";
     }
   }
   }
@@ -1130,11 +960,9 @@ const char *http_status_reason(int status) {
 int http_format_date(char *buf, size_t buf_size, time_t t) {
   struct tm tm;
 #if PLATFORM_WINDOWS
-  if (gmtime_s(&tm, &t) != 0)
-    return -1;
+  if (gmtime_s(&tm, &t) != 0) return -1;
 #else
-  if (gmtime_r(&t, &tm) == NULL)
-    return -1;
+  if (gmtime_r(&t, &tm) == NULL) return -1;
 #endif
   if (strftime(buf, buf_size, "%a, %d %b %Y %H:%M:%S GMT", &tm) == 0)
     return -1;
@@ -1211,94 +1039,14 @@ int http_conn_send_response(http_conn_t *conn, int status, const char *body) {
       return 0;
     }
     conn->last_active = get_time_ms();
-    http_conn_reset(conn);
-    return 0;
-  }
-  http_conn_close(conn);
-  return 0;
-}
-
-int http_conn_send_error(http_conn_t *conn, int status, const char *detail) {
-  char body[1024];
-  const char *reason = http_status_reason(status);
-  int len = snprintf(body, sizeof(body),
-                     "<html><head><title>%d %s</title></head>"
-                     "<body><h1>%d %s</h1><p>%s</p></body></html>",
-                     status, reason, status, reason, detail ? detail : "");
-  if (len < 0 || len >= (int)sizeof(body))
-    return -1;
-
-  if (!conn || conn->sock == INVALID_SOCKET)
-    return -1;
-
-  char extra[128] = "";
-  if (status == 405) {
-    snprintf(extra, sizeof(extra), "Allow: GET, HEAD, POST, PUT, DELETE\r\n");
-  }
-
-  char header[WRITE_BUF_SIZE];
-  int hlen = http_build_response_headers(
-      header, sizeof(header), "HTTP/1.0", status, "text/html", (size_t)len,
-      conn->keep_alive, extra[0] ? extra : NULL);
-  if (hlen < 0 || hlen >= (int)sizeof(header))
-    return -1;
-
-  if (socket_send_all(conn->sock, header, (size_t)hlen) != (ssize_t)hlen) {
-    http_conn_close(conn);
-    return -1;
-  }
-
-  if (conn->method != HTTP_METHOD_HEAD) {
-    if (socket_send_all(conn->sock, body, (size_t)len) != (ssize_t)len) {
-      http_conn_close(conn);
-      return -1;
+    conn->header_count = 0;
+    conn->body_len = 0;
+    conn->expected_content_length = 0;
+    if (conn->upload_fp) {
+      fclose(conn->upload_fp);
+      conn->upload_fp = NULL;
     }
-  }
-
-  if (conn->keep_alive) {
-    http_conn_reset(conn);
-    return 0;
-  }
-  http_conn_close(conn);
-  return 0;
-}
-
-int http_conn_send_redirect(http_conn_t *conn, int status,
-                            const char *location) {
-  char body[512];
-  int len = snprintf(
-      body, sizeof(body),
-      "<html><body><p>Moved to <a href=\"%s\">%s</a></p></body></html>",
-      location, location);
-  if (len < 0 || len >= (int)sizeof(body))
-    return -1;
-
-  char extra[256];
-  snprintf(extra, sizeof(extra), "Location: %s\r\n", location);
-
-  if (!conn || conn->sock == INVALID_SOCKET)
-    return -1;
-  char header[WRITE_BUF_SIZE];
-  int hlen = http_build_response_headers(header, sizeof(header), "HTTP/1.0",
-                                         status, "text/html", (size_t)len,
-                                         conn->keep_alive, extra);
-  if (hlen < 0 || hlen >= (int)sizeof(header))
-    return -1;
-
-  if (socket_send_all(conn->sock, header, (size_t)hlen) != (ssize_t)hlen) {
-    http_conn_close(conn);
-    return -1;
-  }
-
-  if (conn->method != HTTP_METHOD_HEAD) {
-    if (socket_send_all(conn->sock, body, (size_t)len) != (ssize_t)len) {
-      http_conn_close(conn);
-      return -1;
-    }
-  }
-
-  if (conn->keep_alive) {
-    http_conn_reset(conn);
+    http_parser_reset(&conn->parser);
     return 0;
   }
   http_conn_close(conn);
@@ -1485,20 +1233,6 @@ const char *mime_type_from_path(const char *path) {
     return "image/svg+xml";
   if (strcmp(ext, "ico") == 0)
     return "image/x-icon";
-  if (strcmp(ext, "pdf") == 0)
-    return "application/pdf";
-  if (strcmp(ext, "zip") == 0)
-    return "application/zip";
-  if (strcmp(ext, "tar") == 0)
-    return "application/x-tar";
-  if (strcmp(ext, "gz") == 0)
-    return "application/gzip";
-  if (strcmp(ext, "mp3") == 0)
-    return "audio/mpeg";
-  if (strcmp(ext, "mp4") == 0)
-    return "video/mp4";
-  if (strcmp(ext, "wav") == 0)
-    return "audio/wav";
   return "application/octet-stream";
 }
 
@@ -1564,32 +1298,14 @@ int path_is_safe(const char *path) {
 }
 
 int http_conn_send_file(http_conn_t *conn, int status, const char *path) {
-  struct stat st;
-  if (stat(path, &st) != 0)
-    return http_conn_send_error(conn, 404, "File not found");
-
-  /* Handle If-Modified-Since */
-  if (conn->method == HTTP_METHOD_GET &&
-      conn->if_modified_since != (time_t)-1 && conn->if_modified_since > 0) {
-    if (st.st_mtime <= conn->if_modified_since) {
-      return http_conn_send_response(conn, 304, NULL);
-    }
-  }
-
   file_content_t content;
   if (file_read(path, &content) != 0)
-    return http_conn_send_error(conn, 404, "File not found");
-
-  char lm_date[64];
-  http_format_date(lm_date, sizeof(lm_date), st.st_mtime);
-  char extra[128];
-  snprintf(extra, sizeof(extra), "Last-Modified: %s\r\n", lm_date);
-
+    return http_conn_send_response(conn, 404, "File not found");
   const char *mime = mime_type_from_path(path);
   char resp[WRITE_BUF_SIZE];
-  int hlen =
-      http_build_response_headers(resp, sizeof(resp), "HTTP/1.0", status, mime,
-                                  content.size, conn->keep_alive, extra);
+  int hlen = http_build_response_headers(resp, sizeof(resp), "HTTP/1.0",
+                                         status, mime, content.size,
+                                         conn->keep_alive, NULL);
   if (hlen < 0 || hlen >= (int)sizeof(resp)) {
     file_free(&content);
     return -1;
@@ -1601,8 +1317,7 @@ int http_conn_send_file(http_conn_t *conn, int status, const char *path) {
   }
   /* For HEAD requests, do not send the entity body */
   if (conn->method != HTTP_METHOD_HEAD) {
-    if (socket_send_all(conn->sock, content.data, content.size) !=
-        (ssize_t)content.size) {
+    if (socket_send_all(conn->sock, content.data, content.size) != (ssize_t)content.size) {
       file_free(&content);
       http_conn_close(conn);
       return -1;
@@ -1610,7 +1325,9 @@ int http_conn_send_file(http_conn_t *conn, int status, const char *path) {
   }
   file_free(&content);
   if (conn->keep_alive) {
-    http_conn_reset(conn);
+    conn->header_count = 0;
+    conn->body_len = 0;
+    http_parser_reset(&conn->parser);
     return 0;
   }
   http_conn_close(conn);
@@ -1621,7 +1338,7 @@ int http_conn_send_directory_listing(http_conn_t *conn, const char *path,
                                      const char *uri_path) {
   DIR *dir = opendir(path);
   if (!dir)
-    return http_conn_send_error(conn, 403, "Forbidden");
+    return http_conn_send_response(conn, 403, "Forbidden");
 
   // Send Chunked Header
   http_conn_start_chunked_response(conn, 200, "text/html");
@@ -1877,9 +1594,9 @@ int http_conn_send_directory_listing(http_conn_t *conn, const char *path,
 int http_conn_start_chunked_response(http_conn_t *conn, int status,
                                      const char *content_type) {
   char h[WRITE_BUF_SIZE];
-  int hlen = http_build_response_headers(
-      h, sizeof(h), "HTTP/1.1", status, content_type, (size_t)-1,
-      conn->keep_alive, "Transfer-Encoding: chunked\r\n");
+  int hlen = http_build_response_headers(h, sizeof(h), "HTTP/1.1",
+                                         status, content_type, (size_t)-1,
+                                         conn->keep_alive, "Transfer-Encoding: chunked\r\n");
   if (hlen < 0 || hlen >= (int)sizeof(h))
     return -1;
   if (socket_send_all(conn->sock, h, (size_t)hlen) != (ssize_t)hlen) {

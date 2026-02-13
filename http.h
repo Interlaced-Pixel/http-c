@@ -301,6 +301,10 @@ struct http_conn {
   /* Upload streaming to temp file when body is large */
   FILE *upload_fp;
   char upload_path[256];
+  /* Range request support */
+  int has_range;
+  size_t range_start;
+  size_t range_end;
 };
 
 struct http_server {
@@ -617,6 +621,23 @@ static void on_header(void *user_data, const char *field, const char *value) {
             MAX_HEADER_VALUE_LEN - 1);
     conn->headers[conn->header_count].value[MAX_HEADER_VALUE_LEN - 1] = '\0';
     conn->header_count++;
+  }
+
+  /* Parse Range header: bytes=start-end */
+  if (strcasecmp(field, "Range") == 0) {
+    if (strncasecmp(value, "bytes=", 6) == 0) {
+      const char *r = value + 6;
+      char *dash = strchr(r, '-');
+      if (dash) {
+        conn->has_range = 1;
+        conn->range_start = (size_t)atoll(r);
+        if (*(dash + 1) != '\0') {
+          conn->range_end = (size_t)atoll(dash + 1);
+        } else {
+          conn->range_end = 0; /* 0 means until end of file */
+        }
+      }
+    }
   }
 }
 
@@ -1293,6 +1314,19 @@ const char *mime_type_from_path(const char *path) {
     return "image/svg+xml";
   if (strcmp(ext, "ico") == 0)
     return "image/x-icon";
+  /* Video / Audio types for HLS/Streaming */
+  if (strcmp(ext, "m3u8") == 0)
+    return "application/vnd.apple.mpegurl";
+  if (strcmp(ext, "ts") == 0)
+    return "video/mp2t";
+  if (strcmp(ext, "mp4") == 0)
+    return "video/mp4";
+  if (strcmp(ext, "mkv") == 0)
+    return "video/x-matroska";
+  if (strcmp(ext, "webm") == 0)
+    return "video/webm";
+  if (strcmp(ext, "mp3") == 0)
+    return "audio/mpeg";
   return "application/octet-stream";
 }
 
@@ -1358,36 +1392,81 @@ int path_is_safe(const char *path) {
 }
 
 int http_conn_send_file(http_conn_t *conn, int status, const char *path) {
-  file_content_t content;
-  if (file_read(path, &content) != 0)
-    return http_conn_send_response(conn, 404, "File not found");
+  FILE *fp = fopen(path, "rb");
+  if (!fp)
+    return http_conn_send_error(conn, 404, "File not found");
+
+  fseek(fp, 0, SEEK_END);
+  size_t file_size = (size_t)ftell(fp);
+  fseek(fp, 0, SEEK_SET);
+
   const char *mime = mime_type_from_path(path);
+  char extra_headers[256] = "Accept-Ranges: bytes\r\n";
+  size_t start = 0;
+  size_t end = file_size > 0 ? file_size - 1 : 0;
+  size_t content_length = file_size;
+
+  if (conn->has_range) {
+    status = 206;
+    start = conn->range_start;
+    if (conn->range_end > 0 && conn->range_end < file_size) {
+      end = conn->range_end;
+    }
+    if (start >= file_size) {
+      fclose(fp);
+      return http_conn_send_error(conn, 416, "Requested Range Not Satisfiable");
+    }
+    content_length = end - start + 1;
+    snprintf(extra_headers + strlen(extra_headers),
+             sizeof(extra_headers) - strlen(extra_headers),
+             "Content-Range: bytes %zu-%zu/%zu\r\n", start, end, file_size);
+    fseek(fp, (long)start, SEEK_SET);
+  }
+
   char resp[WRITE_BUF_SIZE];
-  int hlen =
-      http_build_response_headers(resp, sizeof(resp), "HTTP/1.0", status, mime,
-                                  content.size, conn->keep_alive, NULL);
+  int hlen = http_build_response_headers(resp, sizeof(resp), "HTTP/1.1", status,
+                                         mime, content_length, conn->keep_alive,
+                                         extra_headers);
+
   if (hlen < 0 || hlen >= (int)sizeof(resp)) {
-    file_free(&content);
+    fclose(fp);
     return -1;
   }
+
   if (socket_send_all(conn->sock, resp, (size_t)hlen) != (ssize_t)hlen) {
-    file_free(&content);
+    fclose(fp);
     http_conn_close(conn);
     return -1;
   }
-  /* For HEAD requests, do not send the entity body */
+
   if (conn->method != HTTP_METHOD_HEAD) {
-    if (socket_send_all(conn->sock, content.data, content.size) !=
-        (ssize_t)content.size) {
-      file_free(&content);
-      http_conn_close(conn);
-      return -1;
+    char buf[4096];
+    size_t total_sent = 0;
+    while (total_sent < content_length) {
+      size_t to_read = content_length - total_sent;
+      if (to_read > sizeof(buf))
+        to_read = sizeof(buf);
+      size_t n = fread(buf, 1, to_read, fp);
+      if (n > 0) {
+        if (socket_send_all(conn->sock, buf, n) != (ssize_t)n) {
+          fclose(fp);
+          http_conn_close(conn);
+          return -1;
+        }
+        total_sent += n;
+      } else {
+        break;
+      }
     }
   }
-  file_free(&content);
+
+  fclose(fp);
   if (conn->keep_alive) {
     conn->header_count = 0;
     conn->body_len = 0;
+    conn->has_range = 0;
+    conn->range_start = 0;
+    conn->range_end = 0;
     http_parser_reset(&conn->parser);
     return 0;
   }
@@ -1402,15 +1481,17 @@ int http_conn_send_directory_listing(http_conn_t *conn, const char *path,
     return http_conn_send_response(conn, 403, "Forbidden");
 
   char html[WRITE_BUF_SIZE];
-  int len = snprintf(html, sizeof(html),
-                     "<!DOCTYPE html><html><head><title>Directory: %s</title>"
-                     "<style>body{font-family:monospace;background:#f0f0f0;margin:20px;}"
-                     "h1{color:#333;}table{border-collapse:collapse;width:100%%;}"
-                     "th,td{border:1px solid #ccc;padding:8px;text-align:left;}"
-                     "th{background:#e0e0e0;}a{text-decoration:none;color:#0066cc;}"
-                     "a:hover{text-decoration:underline;}</style></head><body>"
-                     "<h1>Directory: %s</h1><table><tr><th>Name</th><th>Size</th><th>Modified</th></tr>",
-                     uri_path, uri_path);
+  int len = snprintf(
+      html, sizeof(html),
+      "<!DOCTYPE html><html><head><title>Directory: %s</title>"
+      "<style>body{font-family:monospace;background:#f0f0f0;margin:20px;}"
+      "h1{color:#333;}table{border-collapse:collapse;width:100%%;}"
+      "th,td{border:1px solid #ccc;padding:8px;text-align:left;}"
+      "th{background:#e0e0e0;}a{text-decoration:none;color:#0066cc;}"
+      "a:hover{text-decoration:underline;}</style></head><body>"
+      "<h1>Directory: "
+      "%s</h1><table><tr><th>Name</th><th>Size</th><th>Modified</th></tr>",
+      uri_path, uri_path);
   if (len < 0 || len >= (int)sizeof(html))
     return -1;
 
@@ -1439,7 +1520,8 @@ int http_conn_send_directory_listing(http_conn_t *conn, const char *path,
       else if (st.st_size < 1024 * 1024)
         snprintf(size_str, sizeof(size_str), "%.1f KB", st.st_size / 1024.0);
       else
-        snprintf(size_str, sizeof(size_str), "%.1f MB", st.st_size / (1024.0 * 1024.0));
+        snprintf(size_str, sizeof(size_str), "%.1f MB",
+                 st.st_size / (1024.0 * 1024.0));
     }
 
     struct tm *tm_info = localtime(&st.st_mtime);
@@ -1448,13 +1530,15 @@ int http_conn_send_directory_listing(http_conn_t *conn, const char *path,
 
     const char *link = strcmp(ent->d_name, "..") == 0 ? "../" : ent->d_name;
     if (S_ISDIR(st.st_mode) && strcmp(ent->d_name, "..") != 0) {
-      len = snprintf(buf, sizeof(buf),
-                     "<tr><td><a href=\"%s/\">%s/</a></td><td>%s</td><td>%s</td></tr>",
-                     link, ent->d_name, size_str, date_str);
+      len = snprintf(
+          buf, sizeof(buf),
+          "<tr><td><a href=\"%s/\">%s/</a></td><td>%s</td><td>%s</td></tr>",
+          link, ent->d_name, size_str, date_str);
     } else {
-      len = snprintf(buf, sizeof(buf),
-                     "<tr><td><a href=\"%s\">%s</a></td><td>%s</td><td>%s</td></tr>",
-                     link, ent->d_name, size_str, date_str);
+      len = snprintf(
+          buf, sizeof(buf),
+          "<tr><td><a href=\"%s\">%s</a></td><td>%s</td><td>%s</td></tr>", link,
+          ent->d_name, size_str, date_str);
     }
     if (len > 0)
       http_conn_send_chunk(conn, buf, (size_t)len);

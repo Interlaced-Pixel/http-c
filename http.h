@@ -380,6 +380,8 @@ time_t http_parse_date(const char *str);
 #endif /* HTTP_H */
 
 #ifdef HTTP_IMPLEMENTATION
+#ifndef HTTP_IMPLEMENTATION_DEFINED
+#define HTTP_IMPLEMENTATION_DEFINED
 
 /* Utility implementation */
 static ssize_t socket_send_all(socket_t sock, const void *buf, size_t len);
@@ -388,7 +390,7 @@ char *strdup_safe(const char *s) {
   if (!s)
     return NULL;
   size_t len = strlen(s);
-  char *dup = malloc(len + 1);
+  char *dup = (char *)malloc(len + 1);
   if (dup) {
     memcpy(dup, s, len + 1);
   }
@@ -627,7 +629,7 @@ static void on_header(void *user_data, const char *field, const char *value) {
   if (strcasecmp(field, "Range") == 0) {
     if (strncasecmp(value, "bytes=", 6) == 0) {
       const char *r = value + 6;
-      char *dash = strchr(r, '-');
+      char *dash = (char *)strchr(r, '-');
       if (dash) {
         conn->has_range = 1;
         conn->range_start = (size_t)atoll(r);
@@ -1262,7 +1264,7 @@ int file_read(const char *path, file_content_t *content) {
     fclose(fp);
     return -1;
   }
-  content->data = malloc(size + 1);
+  content->data = (char *)malloc(size + 1);
   if (!content->data) {
     fclose(fp);
     return -1;
@@ -1611,4 +1613,5 @@ int http_conn_send_redirect(http_conn_t *conn, int status,
   return 0;
 }
 
-#endif /* HTTP_H */
+#endif /* HTTP_IMPLEMENTATION_DEFINED */
+#endif /* HTTP_IMPLEMENTATION */

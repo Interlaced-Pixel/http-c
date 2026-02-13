@@ -1,6 +1,10 @@
 #ifndef HTTP_H
 #define HTTP_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Feature test macros for POSIX/GNU extensions */
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
@@ -121,16 +125,18 @@ typedef enum {
 #ifndef LOG_LEVEL
 #define LOG_LEVEL LOG_INFO
 #endif
-#define LOG(level, fmt, ...)                                                   \
+#define LOG(level, ...)                                                        \
   do {                                                                         \
-    if (level <= LOG_LEVEL)                                                    \
+    if (level <= (log_level_t)LOG_LEVEL) {                                     \
       fprintf(                                                                 \
-          stderr, "%s: " fmt "\n",                                             \
+          stderr, "%s: ",                                                      \
           (level == LOG_ERROR                                                  \
                ? "ERR"                                                         \
                : (level == LOG_WARN ? "WRN"                                    \
-                                    : (level == LOG_INFO ? "INF" : "DBG"))),   \
-          ##__VA_ARGS__);                                                      \
+                                    : (level == LOG_INFO ? "INF" : "DBG"))));  \
+      fprintf(stderr, __VA_ARGS__);                                            \
+      fprintf(stderr, "\n");                                                   \
+    }                                                                          \
   } while (0)
 
 /* Platform detection */
@@ -377,18 +383,26 @@ const char *http_status_reason(int status);
 int http_format_date(char *buf, size_t buf_size, time_t t);
 time_t http_parse_date(const char *str);
 
+#ifdef __cplusplus
+}
+#endif
+
 #endif /* HTTP_H */
 
 #ifdef HTTP_IMPLEMENTATION
 #ifndef HTTP_IMPLEMENTATION_DEFINED
 #define HTTP_IMPLEMENTATION_DEFINED
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Utility implementation */
 static ssize_t socket_send_all(socket_t sock, const void *buf, size_t len);
 
 char *strdup_safe(const char *s) {
   if (!s)
-    return NULL;
+    return (char *)NULL;
   size_t len = strlen(s);
   char *dup = (char *)malloc(len + 1);
   if (dup) {
@@ -629,7 +643,7 @@ static void on_header(void *user_data, const char *field, const char *value) {
   if (strcasecmp(field, "Range") == 0) {
     if (strncasecmp(value, "bytes=", 6) == 0) {
       const char *r = value + 6;
-      char *dash = (char *)strchr(r, '-');
+      char *dash = (char *)strchr((char *)r, '-');
       if (dash) {
         conn->has_range = 1;
         conn->range_start = (size_t)atoll(r);
@@ -1284,13 +1298,13 @@ int file_read(const char *path, file_content_t *content) {
 void file_free(file_content_t *content) {
   if (content->data) {
     free(content->data);
-    content->data = NULL;
+    content->data = (char *)NULL;
     content->size = 0;
   }
 }
 
 const char *mime_type_from_path(const char *path) {
-  const char *ext = strrchr(path, '.');
+  const char *ext = (const char *)strrchr(path, '.');
   if (!ext)
     return "application/octet-stream";
   ext++;
@@ -1612,6 +1626,10 @@ int http_conn_send_redirect(http_conn_t *conn, int status,
   http_conn_close(conn);
   return 0;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* HTTP_IMPLEMENTATION_DEFINED */
 #endif /* HTTP_IMPLEMENTATION */

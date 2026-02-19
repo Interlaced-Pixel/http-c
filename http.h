@@ -311,6 +311,10 @@ struct http_conn {
   int has_range;
   size_t range_start;
   size_t range_end;
+  /* Store the HTTP version string seen on the request (e.g. "HTTP/1.1").
+     Use this when formatting responses so the response version matches the
+     request (or a sensible default when empty). */
+  char http_version[16];
 };
 
 struct http_server {
@@ -615,10 +619,20 @@ static void on_request_line(void *user_data, http_method_t method,
   conn->method = method;
   strncpy(conn->uri, uri, sizeof(conn->uri) - 1);
   conn->uri[sizeof(conn->uri) - 1] = '\0';
+  /* Store the request HTTP version for use in responses. If none provided,
+     default to HTTP/1.1 to enable keep-alive semantics by default. */
+  if (version && version[0] != '\0') {
+    strncpy(conn->http_version, version, sizeof(conn->http_version) - 1);
+    conn->http_version[sizeof(conn->http_version) - 1] = '\0';
+  } else {
+    strncpy(conn->http_version, "HTTP/1.1", sizeof(conn->http_version) - 1);
+    conn->http_version[sizeof(conn->http_version) - 1] = '\0';
+  }
   /* Default keep-alive behavior: HTTP/1.1 defaults to keep-alive */
-  if (version && strcmp(version, "HTTP/1.1") == 0) {
+  if (strcmp(conn->http_version, "HTTP/1.1") == 0) {
     conn->keep_alive = 1;
   } else {
+    /* HTTP/1.0 defaults to close unless overridden by "Connection: keep-alive" */
     conn->keep_alive = 0;
   }
   LOG(LOG_DEBUG, "on_request_line: uri=%s version=%s keep_alive=%d fd=%d",
@@ -1104,7 +1118,10 @@ int http_conn_send_response(http_conn_t *conn, int status, const char *body) {
     return -1;
   char header[WRITE_BUF_SIZE];
   size_t body_len = body ? strlen(body) : 0;
-  int hlen = http_build_response_headers(header, sizeof(header), "HTTP/1.0",
+  /* Use stored request version for response; fallback to HTTP/1.1 */
+  const char *resp_ver = (conn->http_version[0] != '\0') ? conn->http_version
+                                                          : "HTTP/1.1";
+  int hlen = http_build_response_headers(header, sizeof(header), resp_ver,
                                          status, "text/plain", body_len,
                                          conn->keep_alive, NULL);
   if (hlen < 0 || hlen >= (int)sizeof(header))
@@ -1440,7 +1457,10 @@ int http_conn_send_file(http_conn_t *conn, int status, const char *path) {
   }
 
   char resp[WRITE_BUF_SIZE];
-  int hlen = http_build_response_headers(resp, sizeof(resp), "HTTP/1.1", status,
+  const char *resp_ver = (conn && conn->http_version[0] != '\0')
+                             ? conn->http_version
+                             : "HTTP/1.1";
+  int hlen = http_build_response_headers(resp, sizeof(resp), resp_ver, status,
                                          mime, content_length, conn->keep_alive,
                                          extra_headers);
 
@@ -1570,8 +1590,11 @@ int http_conn_send_directory_listing(http_conn_t *conn, const char *path,
 int http_conn_start_chunked_response(http_conn_t *conn, int status,
                                      const char *content_type) {
   char h[WRITE_BUF_SIZE];
+  const char *resp_ver = (conn && conn->http_version[0] != '\0')
+                             ? conn->http_version
+                             : "HTTP/1.1";
   int hlen = http_build_response_headers(
-      h, sizeof(h), "HTTP/1.1", status, content_type, (size_t)-1,
+      h, sizeof(h), resp_ver, status, content_type, (size_t)-1,
       conn->keep_alive, "Transfer-Encoding: chunked\r\n");
   if (hlen < 0 || hlen >= (int)sizeof(h))
     return -1;
@@ -1610,8 +1633,11 @@ int http_conn_send_redirect(http_conn_t *conn, int status,
   snprintf(headers, sizeof(headers), "Location: %s\r\n", location);
 
   char response[WRITE_BUF_SIZE];
+  const char *resp_ver = (conn && conn->http_version[0] != '\0')
+                             ? conn->http_version
+                             : "HTTP/1.1";
   int hlen =
-      http_build_response_headers(response, sizeof(response), "HTTP/1.1",
+      http_build_response_headers(response, sizeof(response), resp_ver,
                                   status, NULL, 0, conn->keep_alive, headers);
   if (hlen > 0 && hlen < (int)sizeof(response)) {
     socket_send_all(conn->sock, response, (size_t)hlen);

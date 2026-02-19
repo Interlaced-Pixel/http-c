@@ -6,3 +6,5 @@ dbg.pid
 test.tmp
 *.out
 .DS_Store
+build-*/
+.idea/
